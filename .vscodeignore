@@ -6,3 +6,4 @@ src/**
 *.vsix
 tsconfig.json
 package-lock.json
+media/opencodego.svg
