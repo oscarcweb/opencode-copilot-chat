@@ -2,6 +2,19 @@
 
 All notable changes to the **OpenCode Go BYOK Provider** extension are documented here.
 
+## [0.1.2] — 2026-05-14
+
+### Added
+- Added `opencodego.debugReasoning` to write provider `reasoning_content` to **Output → OpenCode Go** for opt-in debugging.
+
+### Fixed
+- Stopped resolving an extra unconfigured OpenCode Go model group from the legacy command-stored API key.
+- Native Language Models entries are now produced only for configured provider groups, preventing duplicate model rows.
+- Cached native BYOK API keys per resolved model so Copilot chat requests continue to work when VS Code does not pass provider configuration into `provideLanguageModelChatResponse`.
+- Implemented OpenAI-compatible streaming tool-call parsing and conversion to `LanguageModelToolCallPart`, enabling Copilot Agent tool loops for file reads, search, edits, and workspace actions.
+- Preserved assistant tool calls and tool results when converting VS Code chat history back into OpenAI-compatible messages.
+- Captured and replayed DeepSeek `reasoning_content` on follow-up tool-result requests so thinking-mode models can continue multi-step tool workflows without provider errors.
+
 ## [0.1.1] — 2026-05-14
 
 ### Fixed

@@ -6,7 +6,7 @@ const MODELS_URL = "https://opencode.ai/zen/go/v1/models";
 const CHAT_COMPLETIONS_URL = "https://opencode.ai/zen/go/v1/chat/completions";
 const MESSAGES_URL = "https://opencode.ai/zen/go/v1/messages";
 
-type ApiRole = "user" | "assistant";
+type ApiRole = "user" | "assistant" | "tool";
 
 interface OpenCodeGoModel extends vscode.LanguageModelChatInformation {
   endpointKind: "chat-completions" | "messages";
@@ -26,13 +26,32 @@ interface ModelListResponse {
 
 interface ApiMessage {
   role: ApiRole;
-  content: string;
+  content: string | null;
+  reasoning_content?: string;
+  tool_call_id?: string;
+  tool_calls?: OpenAiToolCall[];
+}
+
+interface OpenAiToolCall {
+  id: string;
+  type: "function";
+  function: {
+    name: string;
+    arguments: string;
+  };
+}
+
+interface PendingToolCall {
+  id: string;
+  name: string;
+  arguments: string;
 }
 
 interface ApiSettings {
   temperature: number;
   maxOutputTokensOverride: number;
   maxInputTokensOverride: number;
+  debugReasoning: boolean;
 }
 
 interface LanguageModelConfiguration {
@@ -114,6 +133,8 @@ export function deactivate() {
 class OpenCodeGoProvider implements vscode.LanguageModelChatProvider<OpenCodeGoModel> {
   private readonly changeEmitter = new vscode.EventEmitter<void>();
   readonly onDidChangeLanguageModelChatInformation = this.changeEmitter.event;
+  private readonly apiKeysByModelId = new Map<string, string>();
+  private readonly reasoningContentByToolCallId = new Map<string, string>();
   private outputChannel: vscode.OutputChannel | undefined;
 
   constructor(private readonly context: vscode.ExtensionContext) {}
@@ -266,7 +287,7 @@ class OpenCodeGoProvider implements vscode.LanguageModelChatProvider<OpenCodeGoM
     options: vscode.PrepareLanguageModelChatModelOptions,
     token: vscode.CancellationToken
   ): Promise<OpenCodeGoModel[]> {
-    const apiKey = await this.getApiKey(options as ConfiguredLanguageModelInfoOptions);
+    const apiKey = getConfiguredApiKey(options as ConfiguredLanguageModelInfoOptions);
 
     if (!apiKey) {
       return [];
@@ -281,6 +302,7 @@ class OpenCodeGoProvider implements vscode.LanguageModelChatProvider<OpenCodeGoM
 
     return models.map((modelId) => {
       const limits = modelLimits(modelId, settings);
+      this.apiKeysByModelId.set(modelId, apiKey);
 
       return {
         id: modelId,
@@ -309,17 +331,22 @@ class OpenCodeGoProvider implements vscode.LanguageModelChatProvider<OpenCodeGoM
     progress: vscode.Progress<vscode.LanguageModelResponsePart>,
     token: vscode.CancellationToken
   ): Promise<void> {
-    const apiKey = await this.getApiKey(options as ConfiguredLanguageModelResponseOptions);
+    const apiKey =
+      getConfiguredApiKey(options as ConfiguredLanguageModelResponseOptions)
+      ?? this.apiKeysByModelId.get(model.id);
 
     if (!apiKey) {
-      throw new Error("OpenCode Go API key is required. Use the OpenCode Go gear icon in Language Models to configure it.");
+      throw new Error("OpenCode Go API key is required. Use the OpenCode Go gear icon in Language Models to configure it, then reload the window.");
     }
 
-    const apiMessages = normalizeMessages(messages.map(convertMessage));
+    const apiMessages = normalizeMessages(messages.flatMap((message) => convertMessage(message, this.reasoningContentByToolCallId)));
     const settings = getSettings();
     const limits = modelLimits(model.id, settings);
 
     this.log(`Request: model=${model.id} endpoint=${model.endpointKind} messages=${apiMessages.length}`);
+    if (settings.debugReasoning) {
+      this.log("Reasoning debug is enabled. Provider reasoning_content will be written to this output channel when available.");
+    }
 
     try {
       if (model.endpointKind === "messages") {
@@ -327,7 +354,22 @@ class OpenCodeGoProvider implements vscode.LanguageModelChatProvider<OpenCodeGoM
         return;
       }
 
-      await streamChatCompletions(apiKey, model.id, apiMessages, options, settings, limits, progress, token);
+      await streamChatCompletions(
+        apiKey,
+        model.id,
+        apiMessages,
+        options,
+        settings,
+        limits,
+        progress,
+        token,
+        this.getOutputChannel(),
+        (toolCallIds, reasoningContent) => {
+          for (const toolCallId of toolCallIds) {
+            this.reasoningContentByToolCallId.set(toolCallId, reasoningContent);
+          }
+        }
+      );
       this.log(`Request completed: model=${model.id}`);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -367,16 +409,11 @@ class OpenCodeGoProvider implements vscode.LanguageModelChatProvider<OpenCodeGoM
     }
   }
 
-  private async getApiKey(options?: { configuration?: LanguageModelConfiguration }): Promise<string | undefined> {
-    const configuredApiKey = options?.configuration?.apiKey;
+}
 
-    if (typeof configuredApiKey === "string" && configuredApiKey.trim()) {
-      return configuredApiKey.trim();
-    }
-
-    const storedApiKey = await this.context.secrets.get(SECRET_KEY);
-    return storedApiKey?.trim() || undefined;
-  }
+function getConfiguredApiKey(options?: { configuration?: LanguageModelConfiguration }): string | undefined {
+  const configuredApiKey = options?.configuration?.apiKey;
+  return typeof configuredApiKey === "string" && configuredApiKey.trim() ? configuredApiKey.trim() : undefined;
 }
 
 async function streamChatCompletions(
@@ -387,9 +424,18 @@ async function streamChatCompletions(
   settings: ApiSettings,
   limits: ModelLimits,
   progress: vscode.Progress<vscode.LanguageModelResponsePart>,
-  token: vscode.CancellationToken
+  token: vscode.CancellationToken,
+  output: vscode.OutputChannel,
+  onReasoningContent?: (toolCallIds: string[], reasoningContent: string) => void
 ): Promise<void> {
   const tools = mapOpenAiTools(options.tools);
+  const extractor = new OpenAiResponseExtractor(onReasoningContent, (reasoningContent) => {
+    if (settings.debugReasoning) {
+      output.appendLine("[reasoning_content]");
+      output.appendLine(reasoningContent);
+      output.appendLine("[/reasoning_content]");
+    }
+  });
 
   await streamOpenCodeResponse(
     CHAT_COMPLETIONS_URL,
@@ -404,8 +450,8 @@ async function streamChatCompletions(
     },
     progress,
     token,
-    extractChatCompletionChunk,
-    extractChatCompletionText
+    (data) => extractor.extractStreamParts(data),
+    extractChatCompletionParts
   );
 }
 
@@ -420,6 +466,7 @@ async function streamAnthropicMessages(
   token: vscode.CancellationToken
 ): Promise<void> {
   const tools = mapAnthropicTools(options.tools);
+  const extractor = new AnthropicResponseExtractor();
 
   await streamOpenCodeResponse(
     MESSAGES_URL,
@@ -434,8 +481,8 @@ async function streamAnthropicMessages(
     },
     progress,
     token,
-    extractAnthropicChunk,
-    extractAnthropicText
+    (data) => extractor.extractStreamParts(data),
+    extractAnthropicParts
   );
 }
 
@@ -472,8 +519,8 @@ async function streamOpenCodeResponse(
   body: unknown,
   progress: vscode.Progress<vscode.LanguageModelResponsePart>,
   token: vscode.CancellationToken,
-  extractStreamText: (data: unknown) => string | undefined,
-  extractFullText: (data: unknown) => string | undefined
+  extractStreamParts: (data: unknown) => vscode.LanguageModelResponsePart[],
+  extractFullParts: (data: unknown) => vscode.LanguageModelResponsePart[]
 ): Promise<void> {
   const controller = new AbortController();
   const cancellation = token.onCancellationRequested(() => controller.abort());
@@ -497,9 +544,8 @@ async function streamOpenCodeResponse(
     const contentType = response.headers.get("content-type") ?? "";
     if (!response.body || !contentType.includes("text/event-stream")) {
       const data = await response.json();
-      const text = extractFullText(data);
-      if (text) {
-        progress.report(new vscode.LanguageModelTextPart(text));
+      for (const part of extractFullParts(data)) {
+        progress.report(part);
       }
       return;
     }
@@ -519,29 +565,30 @@ async function streamOpenCodeResponse(
       buffer = events.pop() ?? "";
 
       for (const event of events) {
-        const text = parseServerSentEvent(event, extractStreamText);
-        if (text) {
-          progress.report(new vscode.LanguageModelTextPart(text));
+        for (const part of parseServerSentEvent(event, extractStreamParts)) {
+          progress.report(part);
         }
       }
     }
 
-    const remaining = parseServerSentEvent(buffer, extractStreamText);
-    if (remaining) {
-      progress.report(new vscode.LanguageModelTextPart(remaining));
+    for (const part of parseServerSentEvent(buffer, extractStreamParts)) {
+      progress.report(part);
     }
   } finally {
     cancellation.dispose();
   }
 }
 
-function parseServerSentEvent(event: string, extractText: (data: unknown) => string | undefined): string {
+function parseServerSentEvent(
+  event: string,
+  extractParts: (data: unknown) => vscode.LanguageModelResponsePart[]
+): vscode.LanguageModelResponsePart[] {
   const lines = event
     .split(/\r?\n/)
     .filter((line) => line.startsWith("data:"))
     .map((line) => line.slice("data:".length).trim());
 
-  const chunks: string[] = [];
+  const parts: vscode.LanguageModelResponsePart[] = [];
 
   for (const line of lines) {
     if (!line || line === "[DONE]") {
@@ -550,23 +597,79 @@ function parseServerSentEvent(event: string, extractText: (data: unknown) => str
 
     try {
       const data = JSON.parse(line) as unknown;
-      const text = extractText(data);
-      if (text) {
-        chunks.push(text);
-      }
+      parts.push(...extractParts(data));
     } catch {
       // Ignore malformed SSE lines; the API may send comments or keep-alive frames.
     }
   }
 
-  return chunks.join("");
+  return parts;
 }
 
-function convertMessage(message: vscode.LanguageModelChatRequestMessage): ApiMessage {
-  return {
-    role: message.role === vscode.LanguageModelChatMessageRole.Assistant ? "assistant" : "user",
-    content: messageText(message)
-  };
+function convertMessage(
+  message: vscode.LanguageModelChatRequestMessage,
+  reasoningContentByToolCallId: ReadonlyMap<string, string>
+): ApiMessage[] {
+  const role = message.role === vscode.LanguageModelChatMessageRole.Assistant ? "assistant" : "user";
+  const textParts: string[] = [];
+  const toolCalls: OpenAiToolCall[] = [];
+  const toolResults: ApiMessage[] = [];
+
+  for (const part of message.content) {
+    if (part instanceof vscode.LanguageModelToolCallPart) {
+      toolCalls.push({
+        id: part.callId,
+        type: "function",
+        function: {
+          name: part.name,
+          arguments: JSON.stringify(part.input ?? {})
+        }
+      });
+      continue;
+    }
+
+    if (part instanceof vscode.LanguageModelToolResultPart) {
+      toolResults.push({
+        role: "tool",
+        tool_call_id: part.callId,
+        content: part.content.map(partToText).filter(Boolean).join("\n")
+      });
+      continue;
+    }
+
+    const text = partToText(part);
+    if (text) {
+      textParts.push(text);
+    }
+  }
+
+  const content = textParts.join("\n");
+
+  if (role === "assistant" && toolCalls.length) {
+    return [{
+      role,
+      content: content || null,
+      reasoning_content: reasoningForToolCalls(toolCalls, reasoningContentByToolCallId),
+      tool_calls: toolCalls
+    }];
+  }
+
+  if (toolResults.length) {
+    return content ? [{ role, content }, ...toolResults] : toolResults;
+  }
+
+  return [{ role, content }];
+}
+
+function reasoningForToolCalls(
+  toolCalls: OpenAiToolCall[],
+  reasoningContentByToolCallId: ReadonlyMap<string, string>
+): string | undefined {
+  const reasoning = toolCalls
+    .map((toolCall) => reasoningContentByToolCallId.get(toolCall.id))
+    .filter((value): value is string => Boolean(value?.trim()));
+
+  return reasoning.length ? reasoning.join("\n") : undefined;
 }
 
 function messageText(message: vscode.LanguageModelChatRequestMessage): string {
@@ -597,13 +700,13 @@ function normalizeMessages(messages: ApiMessage[]): ApiMessage[] {
   const normalized: ApiMessage[] = [];
 
   for (const message of messages) {
-    if (!message.content.trim()) {
+    if (!hasMessagePayload(message)) {
       continue;
     }
 
     const previous = normalized.at(-1);
-    if (previous?.role === message.role) {
-      previous.content = `${previous.content}\n\n${message.content}`;
+    if (previous?.role === message.role && message.role !== "tool" && !previous.tool_calls && !message.tool_calls) {
+      previous.content = `${previous.content ?? ""}\n\n${message.content ?? ""}`.trim();
     } else {
       normalized.push({ ...message });
     }
@@ -619,67 +722,186 @@ function normalizeMessages(messages: ApiMessage[]): ApiMessage[] {
   return normalized.length ? normalized : [{ role: "user", content: "" }];
 }
 
-function extractChatCompletionChunk(data: unknown): string | undefined {
-  if (!isRecord(data) || !Array.isArray(data.choices)) {
-    return undefined;
-  }
-
-  const first = data.choices[0];
-  if (!isRecord(first)) {
-    return undefined;
-  }
-
-  const delta = first.delta;
-  if (isRecord(delta) && typeof delta.content === "string") {
-    return delta.content;
-  }
-
-  return undefined;
+function hasMessagePayload(message: ApiMessage): boolean {
+  return Boolean(
+    (typeof message.content === "string" && message.content.trim())
+    || message.tool_calls?.length
+    || message.tool_call_id
+  );
 }
 
-function extractChatCompletionText(data: unknown): string | undefined {
+class OpenAiResponseExtractor {
+  private readonly pendingToolCalls = new Map<number, PendingToolCall>();
+  private reasoningContent = "";
+
+  constructor(
+    private readonly onReasoningContent?: (toolCallIds: string[], reasoningContent: string) => void,
+    private readonly onReasoningDebug?: (reasoningContent: string) => void
+  ) {}
+
+  extractStreamParts(data: unknown): vscode.LanguageModelResponsePart[] {
+    if (!isRecord(data) || !Array.isArray(data.choices)) {
+      return [];
+    }
+
+    const first = data.choices[0];
+    if (!isRecord(first)) {
+      return [];
+    }
+
+    const parts: vscode.LanguageModelResponsePart[] = [];
+    const delta = first.delta;
+    if (isRecord(delta)) {
+      if (typeof delta.content === "string") {
+        parts.push(new vscode.LanguageModelTextPart(delta.content));
+      }
+      if (typeof delta.reasoning_content === "string") {
+        this.reasoningContent += delta.reasoning_content;
+      }
+      this.collectOpenAiToolCalls(delta.tool_calls);
+    }
+
+    if (first.finish_reason === "tool_calls") {
+      parts.push(...this.flushToolCalls());
+    }
+
+    return parts;
+  }
+
+  private collectOpenAiToolCalls(toolCalls: unknown): void {
+    if (!Array.isArray(toolCalls)) {
+      return;
+    }
+
+    for (const toolCall of toolCalls) {
+      if (!isRecord(toolCall)) {
+        continue;
+      }
+
+      const index = typeof toolCall.index === "number" ? toolCall.index : this.pendingToolCalls.size;
+      const pending = this.pendingToolCalls.get(index) ?? { id: "", name: "", arguments: "" };
+      if (typeof toolCall.id === "string") {
+        pending.id = toolCall.id;
+      }
+
+      const fn = toolCall.function;
+      if (isRecord(fn)) {
+        if (typeof fn.name === "string") {
+          pending.name += fn.name;
+        }
+        if (typeof fn.arguments === "string") {
+          pending.arguments += fn.arguments;
+        }
+      }
+
+      this.pendingToolCalls.set(index, pending);
+    }
+  }
+
+  private flushToolCalls(): vscode.LanguageModelToolCallPart[] {
+    const toolCalls = Array.from(this.pendingToolCalls.values())
+      .filter((toolCall) => toolCall.name);
+    const parts = toolCalls
+      .map((toolCall, index) => new vscode.LanguageModelToolCallPart(
+        toolCall.id || `opencodego-tool-${Date.now()}-${index}`,
+        toolCall.name,
+        parseToolInput(toolCall.arguments)
+      ));
+
+    if (this.reasoningContent.trim()) {
+      this.onReasoningDebug?.(this.reasoningContent);
+      this.onReasoningContent?.(parts.map((part) => part.callId), this.reasoningContent);
+    }
+
+    this.pendingToolCalls.clear();
+    this.reasoningContent = "";
+    return parts;
+  }
+}
+
+function extractChatCompletionParts(data: unknown): vscode.LanguageModelResponsePart[] {
   if (!isRecord(data) || !Array.isArray(data.choices)) {
-    return undefined;
+    return [];
   }
 
   const first = data.choices[0];
   if (!isRecord(first)) {
-    return undefined;
+    return [];
   }
 
+  const parts: vscode.LanguageModelResponsePart[] = [];
   const message = first.message;
-  if (isRecord(message) && typeof message.content === "string") {
-    return message.content;
+  if (isRecord(message)) {
+    if (typeof message.content === "string") {
+      parts.push(new vscode.LanguageModelTextPart(message.content));
+    }
+    for (const toolCallPart of toolCallPartsFromOpenAiMessage(message.tool_calls, typeof message.reasoning_content === "string" ? message.reasoning_content : undefined)) {
+      parts.push(toolCallPart);
+    }
   }
 
   if (typeof first.text === "string") {
-    return first.text;
+    parts.push(new vscode.LanguageModelTextPart(first.text));
   }
 
-  return undefined;
+  return parts;
 }
 
-function extractAnthropicChunk(data: unknown): string | undefined {
-  if (!isRecord(data)) {
-    return undefined;
-  }
+class AnthropicResponseExtractor {
+  extractStreamParts(data: unknown): vscode.LanguageModelResponsePart[] {
+    if (!isRecord(data)) {
+      return [];
+    }
 
-  const delta = data.delta;
-  if (isRecord(delta) && typeof delta.text === "string") {
-    return delta.text;
-  }
+    const delta = data.delta;
+    if (isRecord(delta) && typeof delta.text === "string") {
+      return [new vscode.LanguageModelTextPart(delta.text)];
+    }
 
-  return undefined;
+    return [];
+  }
 }
 
-function extractAnthropicText(data: unknown): string | undefined {
+function extractAnthropicParts(data: unknown): vscode.LanguageModelResponsePart[] {
   if (!isRecord(data) || !Array.isArray(data.content)) {
-    return undefined;
+    return [];
   }
 
-  return data.content
+  const text = data.content
     .map((part) => isRecord(part) && typeof part.text === "string" ? part.text : "")
     .join("");
+
+  return text ? [new vscode.LanguageModelTextPart(text)] : [];
+}
+
+function toolCallPartsFromOpenAiMessage(toolCalls: unknown, _reasoningContent?: string): vscode.LanguageModelToolCallPart[] {
+  if (!Array.isArray(toolCalls)) {
+    return [];
+  }
+
+  return toolCalls
+    .filter(isRecord)
+    .map((toolCall, index) => {
+      const fn = toolCall.function;
+      const id = typeof toolCall.id === "string" ? toolCall.id : `opencodego-tool-${Date.now()}-${index}`;
+      const name = isRecord(fn) && typeof fn.name === "string" ? fn.name : "";
+      const args = isRecord(fn) && typeof fn.arguments === "string" ? fn.arguments : "{}";
+      return name ? new vscode.LanguageModelToolCallPart(id, name, parseToolInput(args)) : undefined;
+    })
+    .filter((part): part is vscode.LanguageModelToolCallPart => Boolean(part));
+}
+
+function parseToolInput(value: string): object {
+  if (!value.trim()) {
+    return {};
+  }
+
+  try {
+    const parsed = JSON.parse(value);
+    return isRecord(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
 }
 
 function getSettings(): ApiSettings {
@@ -688,7 +910,8 @@ function getSettings(): ApiSettings {
   return {
     temperature: config.get("temperature", 0.2),
     maxOutputTokensOverride: config.get("maxTokens", 0),
-    maxInputTokensOverride: config.get("maxInputTokens", 0)
+    maxInputTokensOverride: config.get("maxInputTokens", 0),
+    debugReasoning: config.get("debugReasoning", false)
   };
 }
 

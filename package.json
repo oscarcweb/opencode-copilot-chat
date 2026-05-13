@@ -2,7 +2,7 @@
   "name": "opencodego-vscode",
   "displayName": "OpenCode Go BYOK Provider",
   "description": "Adds OpenCode Go models to VS Code and GitHub Copilot Chat through the Language Model Chat Provider API. Bring your own API key (BYOK).",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "publisher": "ltmoerdani",
   "license": "MIT",
   "icon": "media/opencodego.png",
@@ -78,6 +78,11 @@
           "default": 0,
           "minimum": 0,
           "description": "Optional context size override advertised to VS Code. Use 0 to advertise each OpenCode Go model's configured context window."
+        },
+        "opencodego.debugReasoning": {
+          "type": "boolean",
+          "default": false,
+          "description": "Write provider reasoning_content to the OpenCode Go output channel for debugging. Reasoning is not shown in Copilot Chat."
         }
       }
     },

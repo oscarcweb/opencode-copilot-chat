@@ -64,6 +64,7 @@ For the native BYOK flow, prefer the gear icon in **Language Models**. VS Code w
 | `opencodego.temperature` | `number` | `0.2` | Sampling temperature for chat completions (`0`–`2`) |
 | `opencodego.maxTokens` | `number` | `0` | Max output token override — `0` uses the per-model bundled maximum |
 | `opencodego.maxInputTokens` | `number` | `0` | Context window override — `0` uses the per-model bundled context size |
+| `opencodego.debugReasoning` | `boolean` | `false` | Write provider `reasoning_content` to **Output → OpenCode Go** for debugging |
 
 ---
 
