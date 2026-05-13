@@ -2,6 +2,13 @@
 
 All notable changes to the **OpenCode Go BYOK Provider** extension are documented here.
 
+## [0.1.1] — 2026-05-14
+
+### Fixed
+- Switched the Language Models gear flow to VS Code's native provider configuration schema.
+- Added `apiKey` as a secret provider configuration field so configure/add prompts proceed from **Group Name** to **OpenCode Go API Key**.
+- Provider now reads the configured API key from VS Code's language model configuration, with the command-stored key kept as a fallback.
+
 ## [0.1.0] — 2026-05-14
 
 ### Added

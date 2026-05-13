@@ -35,6 +35,18 @@ interface ApiSettings {
   maxInputTokensOverride: number;
 }
 
+interface LanguageModelConfiguration {
+  apiKey?: unknown;
+}
+
+type ConfiguredLanguageModelInfoOptions = vscode.PrepareLanguageModelChatModelOptions & {
+  configuration?: LanguageModelConfiguration;
+};
+
+type ConfiguredLanguageModelResponseOptions = vscode.ProvideLanguageModelChatResponseOptions & {
+  configuration?: LanguageModelConfiguration;
+};
+
 interface ModelLimits {
   contextWindow: number;
   maxOutputTokens: number;
@@ -92,6 +104,7 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand("opencodego.diagnostics", () => provider.showDiagnostics()),
     vscode.commands.registerCommand("opencodego.setApiKey", () => provider.setApiKey())
   );
+
 }
 
 export function deactivate() {
@@ -101,14 +114,35 @@ export function deactivate() {
 class OpenCodeGoProvider implements vscode.LanguageModelChatProvider<OpenCodeGoModel> {
   private readonly changeEmitter = new vscode.EventEmitter<void>();
   readonly onDidChangeLanguageModelChatInformation = this.changeEmitter.event;
+  private outputChannel: vscode.OutputChannel | undefined;
 
   constructor(private readonly context: vscode.ExtensionContext) {}
 
+  private getOutputChannel(): vscode.OutputChannel {
+    if (!this.outputChannel) {
+      this.outputChannel = vscode.window.createOutputChannel("OpenCode Go");
+      this.context.subscriptions.push(this.outputChannel);
+    }
+    return this.outputChannel;
+  }
+
+  private log(message: string): void {
+    this.getOutputChannel().appendLine(`[${new Date().toISOString()}] ${message}`);
+  }
+
   async manage(): Promise<void> {
+    const apiKey = await this.context.secrets.get(SECRET_KEY);
+
+    if (!apiKey) {
+      await this.setApiKey();
+      return;
+    }
+
     const choice = await vscode.window.showQuickPick(
       [
         { label: "Set API Key", action: "set" as const },
         { label: "Clear API Key", action: "clear" as const },
+        { label: "Test Connection", action: "test" as const },
         { label: "Refresh Models", action: "refresh" as const }
       ],
       {
@@ -133,8 +167,57 @@ class OpenCodeGoProvider implements vscode.LanguageModelChatProvider<OpenCodeGoM
       return;
     }
 
+    if (choice.action === "test") {
+      await this.testConnection();
+      return;
+    }
+
     this.changeEmitter.fire();
     vscode.window.showInformationMessage("OpenCode Go models refreshed.");
+  }
+
+  async testConnection(): Promise<void> {
+    const apiKey = await this.context.secrets.get(SECRET_KEY);
+    if (!apiKey) {
+      vscode.window.showErrorMessage("OpenCode Go: No API key set. Use 'Set API Key' first.");
+      return;
+    }
+
+    const statusBar = vscode.window.setStatusBarMessage("$(loading~spin) Testing OpenCode Go connection...");
+    this.log(`Testing connection to ${CHAT_COMPLETIONS_URL}`);
+
+    try {
+      const response = await fetch(CHAT_COMPLETIONS_URL, {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${apiKey}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          model: "deepseek-v4-flash",
+          messages: [{ role: "user", content: "reply with just: ok" }],
+          max_tokens: 10,
+          stream: false
+        })
+      });
+
+      const responseText = await response.text();
+      statusBar.dispose();
+      this.log(`Test response (${response.status}): ${responseText}`);
+      this.getOutputChannel().show(true);
+
+      if (response.ok) {
+        vscode.window.showInformationMessage(`OpenCode Go: Connection OK (HTTP ${response.status}). Check Output panel for details.`);
+      } else {
+        vscode.window.showErrorMessage(`OpenCode Go: Connection failed (HTTP ${response.status}). Check Output panel for details.`);
+      }
+    } catch (error) {
+      statusBar.dispose();
+      const message = error instanceof Error ? error.message : String(error);
+      this.log(`Test connection error: ${message}`);
+      this.getOutputChannel().show(true);
+      vscode.window.showErrorMessage(`OpenCode Go: Connection error — ${message}`);
+    }
   }
 
   async setApiKey(): Promise<void> {
@@ -183,14 +266,10 @@ class OpenCodeGoProvider implements vscode.LanguageModelChatProvider<OpenCodeGoM
     options: vscode.PrepareLanguageModelChatModelOptions,
     token: vscode.CancellationToken
   ): Promise<OpenCodeGoModel[]> {
-    const apiKey = await this.context.secrets.get(SECRET_KEY);
+    const apiKey = await this.getApiKey(options as ConfiguredLanguageModelInfoOptions);
 
     if (!apiKey) {
-      if (options.silent) {
-        return [];
-      }
-
-      await this.setApiKey();
+      return [];
     }
 
     if (token.isCancellationRequested) {
@@ -230,22 +309,32 @@ class OpenCodeGoProvider implements vscode.LanguageModelChatProvider<OpenCodeGoM
     progress: vscode.Progress<vscode.LanguageModelResponsePart>,
     token: vscode.CancellationToken
   ): Promise<void> {
-    const apiKey = await this.context.secrets.get(SECRET_KEY);
+    const apiKey = await this.getApiKey(options as ConfiguredLanguageModelResponseOptions);
 
     if (!apiKey) {
-      throw new Error("OpenCode Go API key is required. Use 'OpenCode Go: Manage Provider' to set it.");
+      throw new Error("OpenCode Go API key is required. Use the OpenCode Go gear icon in Language Models to configure it.");
     }
 
     const apiMessages = normalizeMessages(messages.map(convertMessage));
     const settings = getSettings();
     const limits = modelLimits(model.id, settings);
 
-    if (model.endpointKind === "messages") {
-      await streamAnthropicMessages(apiKey, model.id, apiMessages, options, settings, limits, progress, token);
-      return;
-    }
+    this.log(`Request: model=${model.id} endpoint=${model.endpointKind} messages=${apiMessages.length}`);
 
-    await streamChatCompletions(apiKey, model.id, apiMessages, options, settings, limits, progress, token);
+    try {
+      if (model.endpointKind === "messages") {
+        await streamAnthropicMessages(apiKey, model.id, apiMessages, options, settings, limits, progress, token);
+        return;
+      }
+
+      await streamChatCompletions(apiKey, model.id, apiMessages, options, settings, limits, progress, token);
+      this.log(`Request completed: model=${model.id}`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.log(`ERROR model=${model.id}: ${message}`);
+      this.getOutputChannel().show(true);
+      throw error;
+    }
   }
 
   async provideTokenCount(
@@ -276,6 +365,17 @@ class OpenCodeGoProvider implements vscode.LanguageModelChatProvider<OpenCodeGoM
       vscode.window.showWarningMessage(`Could not fetch OpenCode Go model list. Using bundled model list. ${message}`);
       return fallbackModels();
     }
+  }
+
+  private async getApiKey(options?: { configuration?: LanguageModelConfiguration }): Promise<string | undefined> {
+    const configuredApiKey = options?.configuration?.apiKey;
+
+    if (typeof configuredApiKey === "string" && configuredApiKey.trim()) {
+      return configuredApiKey.trim();
+    }
+
+    const storedApiKey = await this.context.secrets.get(SECRET_KEY);
+    return storedApiKey?.trim() || undefined;
   }
 }
 

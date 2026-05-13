@@ -34,9 +34,10 @@
 2. Open **GitHub Copilot Chat**.
 3. Click the **model picker** → **Manage Models…**
 4. Select **OpenCode Go**.
-5. Enter your API key when prompted — it is stored in VS Code's Secret Storage.
-6. Choose the models you want available in the picker.
-7. Select any OpenCode Go model and start chatting.
+5. Press `Enter` to accept the default **Group Name**.
+6. Enter your **OpenCode Go API Key** when prompted — VS Code stores it as a secret.
+7. Choose the models you want available in the picker.
+8. Select any OpenCode Go model and start chatting.
 
 > **Tip:** If a model appears in **Language Models** view but not in the chat picker, hover its row and click the eye icon to enable visibility.
 
@@ -48,9 +49,11 @@ Run any command via the Command Palette (`Cmd+Shift+P` / `Ctrl+Shift+P`):
 
 | Command | Description |
 |---|---|
-| `OpenCode Go: Manage Provider` | Open the model selection and management dialog |
-| `OpenCode Go: Set API Key` | Store or update your OpenCode Go API key |
+| `OpenCode Go: Manage Provider` | Manage the legacy fallback API key, refresh models, or test a stored key |
+| `OpenCode Go: Set API Key` | Store or update a legacy fallback OpenCode Go API key |
 | `OpenCode Go: Diagnostics` | Show a markdown report of all registered models |
+
+For the native BYOK flow, prefer the gear icon in **Language Models**. VS Code will ask for a group name first, then the OpenCode Go API key.
 
 ---
 
