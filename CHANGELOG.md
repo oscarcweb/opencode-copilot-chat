@@ -5,7 +5,9 @@ All notable changes to the **OpenCode Go BYOK Provider** extension are documente
 ## [0.1.2] — 2026-05-14
 
 ### Added
-- Added `opencodego.debugReasoning` to write provider `reasoning_content` to **Output → OpenCode Go** for opt-in debugging.
+- Added `opencodego.debugReasoning` to write provider `reasoning_content` to **Output → OpenCode** for opt-in debugging.
+- Added a separate native **OpenCode Zen** provider (`opencodezen`) with its own BYOK configuration flow and free-model list from `https://opencode.ai/zen/v1/models`.
+- Added `OpenCode Zen: Diagnostics` for inspecting Zen models registered with VS Code.
 
 ### Fixed
 - Kept advertised context-size metadata consistent across the Language Models table, Copilot model picker tooltip, and chat context indicator while preserving the full OpenCode Go max-output limit for API requests.

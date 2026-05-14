@@ -1,15 +1,78 @@
 import * as vscode from "vscode";
 
-const VENDOR = "opencodego";
+const GO_VENDOR = "opencodego";
+const ZEN_VENDOR = "opencodezen";
 const SECRET_KEY = "opencodego.apiKey";
-const MODELS_URL = "https://opencode.ai/zen/go/v1/models";
-const CHAT_COMPLETIONS_URL = "https://opencode.ai/zen/go/v1/chat/completions";
-const MESSAGES_URL = "https://opencode.ai/zen/go/v1/messages";
+
+interface ProviderDefinition {
+  vendor: typeof GO_VENDOR | typeof ZEN_VENDOR;
+  displayName: string;
+  modelNamePrefix: string;
+  modelsUrl: string;
+  chatCompletionsUrl: string;
+  messagesUrl: string;
+  categoryOrder: number;
+  testModelId: string;
+  fallbackModels: string[];
+  filterModel?: (modelId: string) => boolean;
+}
+
+const FREE_ZEN_MODEL_IDS = new Set(["big-pickle"]);
+
+const PROVIDERS: Record<ProviderDefinition["vendor"], ProviderDefinition> = {
+  [GO_VENDOR]: {
+    vendor: GO_VENDOR,
+    displayName: "OpenCode Go",
+    modelNamePrefix: "OpenCode Go",
+    modelsUrl: "https://opencode.ai/zen/go/v1/models",
+    chatCompletionsUrl: "https://opencode.ai/zen/go/v1/chat/completions",
+    messagesUrl: "https://opencode.ai/zen/go/v1/messages",
+    categoryOrder: 2,
+    testModelId: "deepseek-v4-flash",
+    fallbackModels: [
+      "minimax-m2.7",
+      "minimax-m2.5",
+      "kimi-k2.6",
+      "kimi-k2.5",
+      "glm-5.1",
+      "glm-5",
+      "deepseek-v4-pro",
+      "deepseek-v4-flash",
+      "qwen3.6-plus",
+      "qwen3.5-plus",
+      "mimo-v2-pro",
+      "mimo-v2-omni",
+      "mimo-v2.5-pro",
+      "mimo-v2.5",
+      "hy3-preview"
+    ]
+  },
+  [ZEN_VENDOR]: {
+    vendor: ZEN_VENDOR,
+    displayName: "OpenCode Zen",
+    modelNamePrefix: "OpenCode Zen",
+    modelsUrl: "https://opencode.ai/zen/v1/models",
+    chatCompletionsUrl: "https://opencode.ai/zen/v1/chat/completions",
+    messagesUrl: "https://opencode.ai/zen/v1/messages",
+    categoryOrder: 3,
+    testModelId: "deepseek-v4-flash-free",
+    fallbackModels: [
+      "deepseek-v4-flash-free",
+      "minimax-m2.5-free",
+      "ring-2.6-1t-free",
+      "trinity-large-preview-free",
+      "nemotron-3-super-free",
+      "big-pickle"
+    ],
+    filterModel: (modelId) => modelId.endsWith("-free") || FREE_ZEN_MODEL_IDS.has(modelId)
+  }
+};
 
 type ApiRole = "user" | "assistant" | "tool";
 
-interface OpenCodeGoModel extends vscode.LanguageModelChatInformation {
+interface OpenCodeModel extends vscode.LanguageModelChatInformation {
   endpointKind: "chat-completions" | "messages";
+  provider: ProviderDefinition;
   category?: {
     label: string;
     order: number;
@@ -88,6 +151,7 @@ const DEFAULT_MODEL_LIMITS: BaseModelLimits = {
 
 const MODEL_LIMITS: Record<string, BaseModelLimits> = {
   "deepseek-v4-flash": { contextWindow: 1000000, maxOutputTokens: 384000 },
+  "deepseek-v4-flash-free": { contextWindow: 1000000, maxOutputTokens: 384000 },
   "deepseek-v4-pro": { contextWindow: 1000000, maxOutputTokens: 384000 },
   "mimo-v2.5": { contextWindow: 1000000, maxOutputTokens: 128000 },
   "mimo-v2.5-pro": { contextWindow: 1048576, maxOutputTokens: 128000 },
@@ -99,9 +163,14 @@ const MODEL_LIMITS: Record<string, BaseModelLimits> = {
   "glm-5": { contextWindow: 202752, maxOutputTokens: 32768 },
   "minimax-m2.7": { contextWindow: 204800, maxOutputTokens: 131072 },
   "minimax-m2.5": { contextWindow: 204800, maxOutputTokens: 65536 },
+  "minimax-m2.5-free": { contextWindow: 204800, maxOutputTokens: 131072 },
   "qwen3.6-plus": { contextWindow: 262144, maxOutputTokens: 65536 },
   "qwen3.5-plus": { contextWindow: 262144, maxOutputTokens: 65536 },
-  "hy3-preview": { contextWindow: 262144, maxOutputTokens: 128000 }
+  "hy3-preview": { contextWindow: 262144, maxOutputTokens: 128000 },
+  "ring-2.6-1t-free": { contextWindow: 262144, maxOutputTokens: 65536 },
+  "trinity-large-preview-free": { contextWindow: 262144, maxOutputTokens: 65536 },
+  "nemotron-3-super-free": { contextWindow: 262144, maxOutputTokens: 65536 },
+  "big-pickle": { contextWindow: 262144, maxOutputTokens: 65536 }
 };
 
 type CopilotCompatibleCapabilities = vscode.LanguageModelChatCapabilities & {
@@ -125,13 +194,16 @@ interface AnthropicToolDefinition {
 }
 
 export function activate(context: vscode.ExtensionContext) {
-  const provider = new OpenCodeGoProvider(context);
+  const goProvider = new OpenCodeProvider(context, PROVIDERS[GO_VENDOR]);
+  const zenProvider = new OpenCodeProvider(context, PROVIDERS[ZEN_VENDOR]);
 
   context.subscriptions.push(
-    vscode.lm.registerLanguageModelChatProvider(VENDOR, provider),
-    vscode.commands.registerCommand("opencodego.manage", () => provider.manage()),
-    vscode.commands.registerCommand("opencodego.diagnostics", () => provider.showDiagnostics()),
-    vscode.commands.registerCommand("opencodego.setApiKey", () => provider.setApiKey())
+    vscode.lm.registerLanguageModelChatProvider(GO_VENDOR, goProvider),
+    vscode.lm.registerLanguageModelChatProvider(ZEN_VENDOR, zenProvider),
+    vscode.commands.registerCommand("opencodego.manage", () => goProvider.manage()),
+    vscode.commands.registerCommand("opencodego.diagnostics", () => goProvider.showDiagnostics()),
+    vscode.commands.registerCommand("opencodego.setApiKey", () => goProvider.setApiKey()),
+    vscode.commands.registerCommand("opencodezen.diagnostics", () => zenProvider.showDiagnostics())
   );
 
 }
@@ -140,18 +212,21 @@ export function deactivate() {
   // Nothing to clean up.
 }
 
-class OpenCodeGoProvider implements vscode.LanguageModelChatProvider<OpenCodeGoModel> {
+class OpenCodeProvider implements vscode.LanguageModelChatProvider<OpenCodeModel> {
   private readonly changeEmitter = new vscode.EventEmitter<void>();
   readonly onDidChangeLanguageModelChatInformation = this.changeEmitter.event;
   private readonly apiKeysByModelId = new Map<string, string>();
   private readonly reasoningContentByToolCallId = new Map<string, string>();
   private outputChannel: vscode.OutputChannel | undefined;
 
-  constructor(private readonly context: vscode.ExtensionContext) {}
+  constructor(
+    private readonly context: vscode.ExtensionContext,
+    private readonly definition: ProviderDefinition
+  ) {}
 
   private getOutputChannel(): vscode.OutputChannel {
     if (!this.outputChannel) {
-      this.outputChannel = vscode.window.createOutputChannel("OpenCode Go");
+      this.outputChannel = vscode.window.createOutputChannel("OpenCode");
       this.context.subscriptions.push(this.outputChannel);
     }
     return this.outputChannel;
@@ -177,7 +252,7 @@ class OpenCodeGoProvider implements vscode.LanguageModelChatProvider<OpenCodeGoM
         { label: "Refresh Models", action: "refresh" as const }
       ],
       {
-        title: "Manage OpenCode Go",
+        title: `Manage ${this.definition.displayName}`,
         placeHolder: "Choose an action"
       }
     );
@@ -204,28 +279,28 @@ class OpenCodeGoProvider implements vscode.LanguageModelChatProvider<OpenCodeGoM
     }
 
     this.changeEmitter.fire();
-    vscode.window.showInformationMessage("OpenCode Go models refreshed.");
+    vscode.window.showInformationMessage(`${this.definition.displayName} models refreshed.`);
   }
 
   async testConnection(): Promise<void> {
     const apiKey = await this.context.secrets.get(SECRET_KEY);
     if (!apiKey) {
-      vscode.window.showErrorMessage("OpenCode Go: No API key set. Use 'Set API Key' first.");
+      vscode.window.showErrorMessage(`${this.definition.displayName}: No API key set. Use 'Set API Key' first.`);
       return;
     }
 
-    const statusBar = vscode.window.setStatusBarMessage("$(loading~spin) Testing OpenCode Go connection...");
-    this.log(`Testing connection to ${CHAT_COMPLETIONS_URL}`);
+    const statusBar = vscode.window.setStatusBarMessage(`$(loading~spin) Testing ${this.definition.displayName} connection...`);
+    this.log(`Testing connection to ${this.definition.chatCompletionsUrl}`);
 
     try {
-      const response = await fetch(CHAT_COMPLETIONS_URL, {
+      const response = await fetch(this.definition.chatCompletionsUrl, {
         method: "POST",
         headers: {
           "Authorization": `Bearer ${apiKey}`,
           "Content-Type": "application/json"
         },
         body: JSON.stringify({
-          model: "deepseek-v4-flash",
+          model: this.definition.testModelId,
           messages: [{ role: "user", content: "reply with just: ok" }],
           max_tokens: 10,
           stream: false
@@ -238,16 +313,16 @@ class OpenCodeGoProvider implements vscode.LanguageModelChatProvider<OpenCodeGoM
       this.getOutputChannel().show(true);
 
       if (response.ok) {
-        vscode.window.showInformationMessage(`OpenCode Go: Connection OK (HTTP ${response.status}). Check Output panel for details.`);
+        vscode.window.showInformationMessage(`${this.definition.displayName}: Connection OK (HTTP ${response.status}). Check Output panel for details.`);
       } else {
-        vscode.window.showErrorMessage(`OpenCode Go: Connection failed (HTTP ${response.status}). Check Output panel for details.`);
+        vscode.window.showErrorMessage(`${this.definition.displayName}: Connection failed (HTTP ${response.status}). Check Output panel for details.`);
       }
     } catch (error) {
       statusBar.dispose();
       const message = error instanceof Error ? error.message : String(error);
       this.log(`Test connection error: ${message}`);
       this.getOutputChannel().show(true);
-      vscode.window.showErrorMessage(`OpenCode Go: Connection error — ${message}`);
+      vscode.window.showErrorMessage(`${this.definition.displayName}: Connection error - ${message}`);
     }
   }
 
@@ -269,7 +344,7 @@ class OpenCodeGoProvider implements vscode.LanguageModelChatProvider<OpenCodeGoM
   }
 
   async showDiagnostics(): Promise<void> {
-    const models = await vscode.lm.selectChatModels({ vendor: VENDOR });
+    const models = await vscode.lm.selectChatModels({ vendor: this.definition.vendor });
     const lines = models.map((model) => {
       const limits = modelLimits(model.id);
       return [
@@ -287,9 +362,9 @@ class OpenCodeGoProvider implements vscode.LanguageModelChatProvider<OpenCodeGoM
     });
 
     const content = [
-      "# OpenCode Go Diagnostics",
+      `# ${this.definition.displayName} Diagnostics`,
       "",
-      `Models visible through vscode.lm.selectChatModels({ vendor: "${VENDOR}" }): ${models.length}`,
+      `Models visible through vscode.lm.selectChatModels({ vendor: "${this.definition.vendor}" }): ${models.length}`,
       "",
       ...lines
     ].join("\n");
@@ -301,7 +376,7 @@ class OpenCodeGoProvider implements vscode.LanguageModelChatProvider<OpenCodeGoM
   async provideLanguageModelChatInformation(
     options: vscode.PrepareLanguageModelChatModelOptions,
     token: vscode.CancellationToken
-  ): Promise<OpenCodeGoModel[]> {
+  ): Promise<OpenCodeModel[]> {
     const apiKey = getConfiguredApiKey(options as ConfiguredLanguageModelInfoOptions);
 
     if (!apiKey) {
@@ -321,26 +396,27 @@ class OpenCodeGoProvider implements vscode.LanguageModelChatProvider<OpenCodeGoM
 
       return {
         id: modelId,
-        name: `OpenCode Go / ${formatModelName(modelId)}`,
-        family: `opencodego-${modelId}`,
+        name: `${this.definition.modelNamePrefix} / ${formatModelName(modelId)}`,
+        family: `${this.definition.vendor}-${modelId}`,
         version: "1.0.0",
-        detail: "OpenCode Go",
-        tooltip: `OpenCode Go model: ${modelId}`,
+        detail: this.definition.vendor === ZEN_VENDOR && isFreeZenModel(modelId) ? "Free" : this.definition.displayName,
+        tooltip: `${this.definition.displayName} model: ${modelId}`,
         category: {
-          label: "OpenCode Go",
-          order: 2
+          label: this.definition.displayName,
+          order: this.definition.categoryOrder
         },
         isUserSelectable: true,
         maxInputTokens: limits.advertisedMaxInputTokens,
         maxOutputTokens: limits.advertisedMaxOutputTokens,
         capabilities: modelCapabilities(),
-        endpointKind: modelEndpointKind(modelId)
+        endpointKind: modelEndpointKind(modelId, this.definition),
+        provider: this.definition
       };
     });
   }
 
   async provideLanguageModelChatResponse(
-    model: OpenCodeGoModel,
+    model: OpenCodeModel,
     messages: readonly vscode.LanguageModelChatRequestMessage[],
     options: vscode.ProvideLanguageModelChatResponseOptions,
     progress: vscode.Progress<vscode.LanguageModelResponsePart>,
@@ -351,7 +427,7 @@ class OpenCodeGoProvider implements vscode.LanguageModelChatProvider<OpenCodeGoM
       ?? this.apiKeysByModelId.get(model.id);
 
     if (!apiKey) {
-      throw new Error("OpenCode Go API key is required. Use the OpenCode Go gear icon in Language Models to configure it, then reload the window.");
+      throw new Error(`${this.definition.displayName} API key is required. Use the ${this.definition.displayName} gear icon in Language Models to configure it, then reload the window.`);
     }
 
     const apiMessages = normalizeMessages(messages.flatMap((message) => convertMessage(message, this.reasoningContentByToolCallId)));
@@ -365,11 +441,12 @@ class OpenCodeGoProvider implements vscode.LanguageModelChatProvider<OpenCodeGoM
 
     try {
       if (model.endpointKind === "messages") {
-        await streamAnthropicMessages(apiKey, model.id, apiMessages, options, settings, limits, progress, token);
+        await streamAnthropicMessages(this.definition.messagesUrl, apiKey, model.id, apiMessages, options, settings, limits, progress, token);
         return;
       }
 
       await streamChatCompletions(
+        this.definition.chatCompletionsUrl,
         apiKey,
         model.id,
         apiMessages,
@@ -395,7 +472,7 @@ class OpenCodeGoProvider implements vscode.LanguageModelChatProvider<OpenCodeGoM
   }
 
   async provideTokenCount(
-    _model: OpenCodeGoModel,
+    _model: OpenCodeModel,
     text: string | vscode.LanguageModelChatRequestMessage,
     _token: vscode.CancellationToken
   ): Promise<number> {
@@ -405,7 +482,7 @@ class OpenCodeGoProvider implements vscode.LanguageModelChatProvider<OpenCodeGoM
 
   private async fetchModels(): Promise<string[]> {
     try {
-      const response = await fetch(MODELS_URL);
+      const response = await fetch(this.definition.modelsUrl);
 
       if (!response.ok) {
         throw new Error(`Model list request failed (${response.status}): ${response.statusText}`);
@@ -414,13 +491,14 @@ class OpenCodeGoProvider implements vscode.LanguageModelChatProvider<OpenCodeGoM
       const data = await response.json() as ModelListResponse;
       const ids = data.data
         ?.map((model) => model.id)
-        .filter((id): id is string => typeof id === "string" && id.length > 0);
+        .filter((id): id is string => typeof id === "string" && id.length > 0)
+        .filter((id) => this.definition.filterModel?.(id) ?? true);
 
-      return ids?.length ? ids : fallbackModels();
+      return ids?.length ? ids : this.definition.fallbackModels;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      vscode.window.showWarningMessage(`Could not fetch OpenCode Go model list. Using bundled model list. ${message}`);
-      return fallbackModels();
+      vscode.window.showWarningMessage(`Could not fetch ${this.definition.displayName} model list. Using bundled model list. ${message}`);
+      return this.definition.fallbackModels;
     }
   }
 
@@ -432,6 +510,7 @@ function getConfiguredApiKey(options?: { configuration?: LanguageModelConfigurat
 }
 
 async function streamChatCompletions(
+  url: string,
   apiKey: string,
   modelId: string,
   messages: ApiMessage[],
@@ -453,7 +532,7 @@ async function streamChatCompletions(
   });
 
   await streamOpenCodeResponse(
-    CHAT_COMPLETIONS_URL,
+    url,
     apiKey,
     {
       model: modelId,
@@ -471,6 +550,7 @@ async function streamChatCompletions(
 }
 
 async function streamAnthropicMessages(
+  url: string,
   apiKey: string,
   modelId: string,
   messages: ApiMessage[],
@@ -484,7 +564,7 @@ async function streamAnthropicMessages(
   const extractor = new AnthropicResponseExtractor();
 
   await streamOpenCodeResponse(
-    MESSAGES_URL,
+    url,
     apiKey,
     {
       model: modelId,
@@ -977,8 +1057,16 @@ function modelCapabilities(): CopilotCompatibleCapabilities {
   };
 }
 
-function modelEndpointKind(modelId: string): OpenCodeGoModel["endpointKind"] {
-  return modelId.startsWith("minimax-m2.") ? "messages" : "chat-completions";
+function modelEndpointKind(modelId: string, provider: ProviderDefinition): OpenCodeModel["endpointKind"] {
+  if (provider.vendor === GO_VENDOR && modelId.startsWith("minimax-m2.")) {
+    return "messages";
+  }
+
+  return "chat-completions";
+}
+
+function isFreeZenModel(modelId: string): boolean {
+  return modelId.endsWith("-free") || FREE_ZEN_MODEL_IDS.has(modelId);
 }
 
 function formatModelName(modelId: string): string {
@@ -986,26 +1074,6 @@ function formatModelName(modelId: string): string {
     .split("-")
     .map((part) => part.toUpperCase() === part ? part : part.charAt(0).toUpperCase() + part.slice(1))
     .join(" ");
-}
-
-function fallbackModels(): string[] {
-  return [
-    "minimax-m2.7",
-    "minimax-m2.5",
-    "kimi-k2.6",
-    "kimi-k2.5",
-    "glm-5.1",
-    "glm-5",
-    "deepseek-v4-pro",
-    "deepseek-v4-flash",
-    "qwen3.6-plus",
-    "qwen3.5-plus",
-    "mimo-v2-pro",
-    "mimo-v2-omni",
-    "mimo-v2.5-pro",
-    "mimo-v2.5",
-    "hy3-preview"
-  ];
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

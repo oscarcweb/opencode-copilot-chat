@@ -1,7 +1,7 @@
 {
-  "name": "opencodego-vscode",
-  "displayName": "OpenCode Go BYOK Provider",
-  "description": "Adds OpenCode Go models to VS Code and GitHub Copilot Chat through the Language Model Chat Provider API. Bring your own API key (BYOK).",
+  "name": "opencode-copilot-chat",
+  "displayName": "OpenCode Copilot Chat",
+  "description": "Bring your own OpenCode API key to VS Code Copilot Chat. Adds OpenCode Go and OpenCode Zen models through the Language Model Chat Provider API.",
   "version": "0.1.2",
   "publisher": "ltmoerdani",
   "license": "MIT",
@@ -12,6 +12,7 @@
   },
   "keywords": [
     "opencode",
+    "opencode-copilot-chat",
     "copilot",
     "byok",
     "ai",
@@ -22,12 +23,12 @@
   ],
   "repository": {
     "type": "git",
-    "url": "https://github.com/ltmoerdani/opencode-go-copilot.git"
+    "url": "https://github.com/ltmoerdani/opencode-copilot-chat.git"
   },
   "bugs": {
-    "url": "https://github.com/ltmoerdani/opencode-go-copilot/issues"
+    "url": "https://github.com/ltmoerdani/opencode-copilot-chat/issues"
   },
-  "homepage": "https://github.com/ltmoerdani/opencode-go-copilot#readme",
+  "homepage": "https://github.com/ltmoerdani/opencode-copilot-chat#readme",
   "engines": {
     "vscode": "^1.118.0"
   },
@@ -39,7 +40,9 @@
     "onCommand:opencodego.manage",
     "onCommand:opencodego.diagnostics",
     "onCommand:opencodego.setApiKey",
-    "onLanguageModelChatProvider:opencodego"
+    "onCommand:opencodezen.diagnostics",
+    "onLanguageModelChatProvider:opencodego",
+    "onLanguageModelChatProvider:opencodezen"
   ],
   "main": "./out/extension.js",
   "contributes": {
@@ -55,10 +58,14 @@
       {
         "command": "opencodego.diagnostics",
         "title": "OpenCode Go: Diagnostics"
+      },
+      {
+        "command": "opencodezen.diagnostics",
+        "title": "OpenCode Zen: Diagnostics"
       }
     ],
     "configuration": {
-      "title": "OpenCode Go",
+      "title": "OpenCode",
       "properties": {
         "opencodego.temperature": {
           "type": "number",
@@ -71,18 +78,18 @@
           "type": "number",
           "default": 0,
           "minimum": 0,
-          "description": "Optional max output token override. Use 0 to request each OpenCode Go model's configured maximum."
+          "description": "Optional max output token override. Use 0 to request each OpenCode model's configured maximum."
         },
         "opencodego.maxInputTokens": {
           "type": "number",
           "default": 0,
           "minimum": 0,
-          "description": "Optional context size override advertised to VS Code. Use 0 to advertise each OpenCode Go model's configured context window."
+          "description": "Optional context size override advertised to VS Code. Use 0 to advertise each OpenCode model's configured context window."
         },
         "opencodego.debugReasoning": {
           "type": "boolean",
           "default": false,
-          "description": "Write provider reasoning_content to the OpenCode Go output channel for debugging. Reasoning is not shown in Copilot Chat."
+          "description": "Write provider reasoning_content to the OpenCode output channel for debugging. Reasoning is not shown in Copilot Chat."
         }
       }
     },
@@ -100,6 +107,24 @@
               "type": "string",
               "title": "OpenCode Go API Key",
               "description": "Enter your OpenCode Go API key.",
+              "secret": true
+            }
+          }
+        }
+      },
+      {
+        "vendor": "opencodezen",
+        "displayName": "OpenCode Zen",
+        "configuration": {
+          "type": "object",
+          "required": [
+            "apiKey"
+          ],
+          "properties": {
+            "apiKey": {
+              "type": "string",
+              "title": "OpenCode Zen API Key",
+              "description": "Enter your OpenCode Zen API key.",
               "secret": true
             }
           }

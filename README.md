@@ -1,18 +1,32 @@
-# OpenCode Go — BYOK Provider for Copilot
+# OpenCode for GitHub Copilot Chat
 
-> **Bring Your Own Key.** Add [OpenCode Go](https://opencode.ai) models to VS Code and GitHub Copilot Chat through the official Language Model Chat Provider API.
+> **Use [OpenCode](https://opencode.ai) models directly in GitHub Copilot Chat — no Copilot Pro/Enterprise subscription needed. Just bring your own API key (BYOK).**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
-[![VS Code](https://img.shields.io/badge/VS%20Code-1.118%2B-blue)](https://code.visualstudio.com/)
+[![VS Code](https://img.shields.io/badge/VS%20Code-1.120%2B-blue)](https://code.visualstudio.com/)
+[![OpenCode](https://img.shields.io/badge/OpenCode-Go%20|%20Zen-6c47ff)](https://opencode.ai)
+
+---
+
+## What Is This?
+
+**OpenCode for GitHub Copilot Chat** is a VS Code extension that registers models from [OpenCode](https://opencode.ai) — both **OpenCode Go** (paid) and **OpenCode Zen** (free) — into **GitHub Copilot Chat** via the official VS Code *Language Model Chat Provider API*.
+
+This lets you pick and use OpenCode models directly from the Copilot Chat model picker, just like selecting GPT-4 or Claude — no extra Copilot Pro/Enterprise subscription required. Simply enter your OpenCode API key.
+
+| Provider | Cost | Example Models |
+|---|---|---|
+| **OpenCode Go** | Paid (top-up) | DeepSeek V4, Kimi K2.6, MiniMax M2.7, GLM-5.1, MiMo V2.5, Qwen3.6 |
+| **OpenCode Zen** | Free | DeepSeek V4 Flash Free, MiniMax M2.5 Free, Ring 2.6 1T Free, Big Pickle |
 
 ---
 
 ## ✨ Features
 
-- **BYOK** — supply your own OpenCode Go API key; no subscription upsell
-- **Live model list** — fetches available models directly from the OpenCode Go API on startup
-- **Bundled fallback** — works offline or if the API is unreachable, using a curated model table
-- **Per-model token limits** — accurate context window and max output token values per model, not a single global cap
+- **BYOK** — configure OpenCode Go and OpenCode Zen independently with separate API keys, both active at the same time
+- **Live model list** — fetches available Go models and Zen free models directly from OpenCode on every startup
+- **Bundled fallback** — works offline or if the API is unreachable, using a curated model table with accurate token limits
+- **Per-model token limits** — precise context window and max output token values per model, not a single global cap
 - **Tool-calling support** — forwards tool schemas using OpenAI-compatible or Anthropic-compatible request shapes automatically based on the model endpoint
 - **Dual endpoint routing** — routes standard models to `/chat/completions` and MiniMax M2 models to `/messages` transparently
 - **Diagnostics command** — one-click markdown report showing exactly which models VS Code has registered
@@ -21,39 +35,46 @@
 
 ## Requirements
 
-- VS Code **1.118.0** or higher with the Language Model Chat Provider API
-- **GitHub Copilot Chat** installed and signed in
-- For Copilot Business or Enterprise: the organization policy **Bring Your Own Language Model Key in VS Code** must be enabled
-- An **OpenCode Go API key** — get one at [opencode.ai](https://opencode.ai)
+- VS Code **1.120.0** or higher with the Language Model Chat Provider API
+- **GitHub Copilot Chat** extension — [install from marketplace](https://marketplace.visualstudio.com/items?itemName=GitHub.copilot-chat) (required — this extension only adds models *into* Copilot Chat)
+- Sign in to GitHub Copilot Chat (a personal GitHub account is sufficient — **no** Copilot Pro/Enterprise needed for BYOK)
+- An **OpenCode Go API key** for Go models, or an **OpenCode Zen API key** for Zen free models — get one at [opencode.ai](https://opencode.ai)
 
 ---
 
 ## ⚡ Quick Start
 
-1. Install the extension (or press `F5` in the repo to launch a dev host).
-2. Open **GitHub Copilot Chat**.
-3. Click the **model picker** → **Manage Models…**
-4. Select **OpenCode Go**.
-5. Press `Enter` to accept the default **Group Name**.
-6. Enter your **OpenCode Go API Key** when prompted — VS Code stores it as a secret.
-7. Choose the models you want available in the picker.
-8. Select any OpenCode Go model and start chatting.
+1. Install **GitHub Copilot Chat** from the marketplace if you haven't already.
+2. Install this extension (or press `F5` in the repo to launch an Extension Development Host).
+3. Open **GitHub Copilot Chat** (click the Copilot icon in the sidebar or press `Cmd+Shift+I` / `Ctrl+Shift+I`).
+4. Click the **model picker** (current model name) → **Manage Models…**
+5. Select **OpenCode Go** or **OpenCode Zen**.
+6. Press `Enter` to accept the default **Group Name**.
+7. Enter your OpenCode **API Key** when prompted — VS Code stores it securely as a secret.
+8. Choose the models you want available.
+9. Select any OpenCode model from the picker and start chatting.
 
-> **Tip:** If a model appears in **Language Models** view but not in the chat picker, hover its row and click the eye icon to enable visibility.
+> **💡 Tips:**
+> - Registered models are automatically available in the Copilot Chat model picker — no extra setup needed.
+> - If a model appears in the **Language Models** view but not in the chat picker, hover its row and click the eye icon (👁) to enable visibility.
+> - **Go** and **Zen** are separate provider groups, so both can be active at the same time. Switch between them anytime from the model picker.
 
 ---
 
 ## Commands
 
-Run any command via the Command Palette (`Cmd+Shift+P` / `Ctrl+Shift+P`):
+Once installed, OpenCode models appear directly in the **GitHub Copilot Chat model picker** — no special commands needed. The easiest way to manage your API key is via **Settings → Language Models** (gear icon ⚙).
+
+For advanced usage, you can also run these commands via the Command Palette (`Cmd+Shift+P` / `Ctrl+Shift+P`):
 
 | Command | Description |
 |---|---|
-| `OpenCode Go: Manage Provider` | Manage the legacy fallback API key, refresh models, or test a stored key |
+| `OpenCode Go: Manage Provider` | Manage legacy fallback API key, refresh models, or test connection |
 | `OpenCode Go: Set API Key` | Store or update a legacy fallback OpenCode Go API key |
-| `OpenCode Go: Diagnostics` | Show a markdown report of all registered models |
+| `OpenCode Go: Diagnostics` | Show a markdown report of all registered OpenCode Go models |
+| `OpenCode Zen: Diagnostics` | Show a markdown report of all registered OpenCode Zen free models |
 
-For the native BYOK flow, prefer the gear icon in **Language Models**. VS Code will ask for a group name first, then the OpenCode Go API key.
+> **Note:** The native BYOK flow via **Language Models** (gear icon ⚙) is recommended. VS Code will ask for a group name, then the matching API key. Go and Zen are separate provider groups, so both can be active at the same time.
 
 ---
 
@@ -64,27 +85,31 @@ For the native BYOK flow, prefer the gear icon in **Language Models**. VS Code w
 | `opencodego.temperature` | `number` | `0.2` | Sampling temperature for chat completions (`0`–`2`) |
 | `opencodego.maxTokens` | `number` | `0` | Max output token override — `0` uses the per-model bundled maximum |
 | `opencodego.maxInputTokens` | `number` | `0` | Context window override — `0` uses the per-model bundled context size |
-| `opencodego.debugReasoning` | `boolean` | `false` | Write provider `reasoning_content` to **Output → OpenCode Go** for debugging |
+| `opencodego.debugReasoning` | `boolean` | `false` | Write provider `reasoning_content` to **Output → OpenCode** for debugging |
 
 ---
 
 ## Models
 
-The extension fetches the live model list from:
+The extension fetches the live model lists from:
 
 ```
-https://opencode.ai/zen/go/v1/models
+https://opencode.ai/zen/go/v1/models   (OpenCode Go — paid)
+https://opencode.ai/zen/v1/models       (OpenCode Zen — free)
 ```
 
-Because the endpoint returns IDs only, a bundled metadata table provides accurate context window and max output tokens per model. If the live fetch fails, the bundled list is used as a fallback.
+The **Go provider** exposes all OpenCode Go models. The **Zen provider** filters the live Zen list to free chat-completions-compatible models (`*-free` plus `big-pickle`) so paid Zen models do not appear unless support is added intentionally.
 
-VS Code and Copilot read separate input/output metadata fields for UI display. OpenCode Go models can have very large output limits, so the extension advertises a small response reserve to keep the Language Models table, model picker tooltip, and chat context indicator consistent while still sending each model's full bundled max output limit to the OpenCode Go API.
+Because the endpoints return model IDs only, a bundled metadata table provides context window and max output tokens per model. If the live fetch fails, the bundled list is used as a fallback.
+
+VS Code and Copilot read separate input/output metadata fields for UI display. OpenCode models can have very large output limits, so the extension advertises a small response reserve to keep the **Language Models** table, model picker tooltip, and chat context indicator consistent while still sending each model's full bundled max output limit to the OpenCode API.
 
 ### Bundled model limits
 
 | Model | Context window | Max output tokens |
 |---|---:|---:|
 | `deepseek-v4-pro` / `deepseek-v4-flash` | 1,000,000 | 384,000 |
+| `deepseek-v4-flash-free` | 1,000,000 | 384,000 |
 | `mimo-v2.5-pro` / `mimo-v2-pro` | 1,048,576 | 128,000 |
 | `mimo-v2.5` | 1,000,000 | 128,000 |
 | `kimi-k2.6` / `kimi-k2.5` | 262,144 | 65,536 |
@@ -93,18 +118,23 @@ VS Code and Copilot read separate input/output metadata fields for UI display. O
 | `mimo-v2-omni` | 262,144 | 65,536 |
 | `minimax-m2.7` | 204,800 | 131,072 |
 | `minimax-m2.5` | 204,800 | 65,536 |
+| `minimax-m2.5-free` | 204,800 | 131,072 |
 | `glm-5.1` / `glm-5` | 202,752 | 32,768 |
+| `ring-2.6-1t-free` / `trinity-large-preview-free` / `nemotron-3-super-free` / `big-pickle` | 262,144 | 65,536 |
 
 Set `opencodego.maxInputTokens` or `opencodego.maxTokens` to a non-zero value to override the bundled defaults globally.
 
 ### Endpoint routing
 
 Most models use the OpenAI-compatible chat completions endpoint:
+
 ```
-https://opencode.ai/zen/go/v1/chat/completions
+https://opencode.ai/zen/go/v1/chat/completions   (Go)
+https://opencode.ai/zen/v1/chat/completions       (Zen)
 ```
 
-MiniMax M2 models (`minimax-m2.*`) are automatically routed to the Anthropic-compatible messages endpoint:
+OpenCode Go MiniMax M2 models (`minimax-m2.*`) are automatically routed to the Anthropic-compatible messages endpoint:
+
 ```
 https://opencode.ai/zen/go/v1/messages
 ```
