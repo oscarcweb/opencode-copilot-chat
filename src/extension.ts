@@ -18,8 +18,14 @@ interface ProviderDefinition {
 }
 
 const FREE_ZEN_MODEL_IDS = new Set(["big-pickle"]);
+const MODELS_DEV_API_URL = "https://models.dev/api.json";
+const KNOWN_UNAVAILABLE_MODEL_IDS = new Set([
+  "ring-2.6-1t",
+  "ring-2.6-1t-free",
+  "trinity-large-preview-free"
+]);
 // Bump this when we need to force VS Code picker metadata refresh.
-const MODEL_METADATA_REVISION = "ctxfix-2026-05-16-b";
+const MODEL_METADATA_REVISION = "ctxfix-2026-05-16-c";
 
 const PROVIDERS: Record<ProviderDefinition["vendor"], ProviderDefinition> = {
   [GO_VENDOR]: {
@@ -62,8 +68,6 @@ const PROVIDERS: Record<ProviderDefinition["vendor"], ProviderDefinition> = {
     fallbackModels: [
       "deepseek-v4-flash-free",
       "minimax-m2.5-free",
-      "ring-2.6-1t-free",
-      "trinity-large-preview-free",
       "nemotron-3-super-free",
       "qwen3.6-plus-free",
       "big-pickle"
@@ -90,6 +94,14 @@ interface ModelListResponse {
     id?: string;
     owned_by?: string;
   }>;
+}
+
+interface ModelsDevResponse {
+  opencode?: {
+    models?: Record<string, {
+      status?: string;
+    }>;
+  };
 }
 
 interface ApiMessage {
@@ -181,7 +193,8 @@ const MODEL_LIMITS_BY_PROVIDER: Record<ProviderDefinition["vendor"], Record<stri
     "minimax-m2.5": { contextWindow: 204800, maxOutputTokens: 131072 },
     "qwen3.6-plus": { contextWindow: 262144, maxOutputTokens: 65536 },
     "qwen3.5-plus": { contextWindow: 262144, maxOutputTokens: 65536 },
-    "hy3-preview": { contextWindow: 256000, maxOutputTokens: 64000 }
+    "hy3-preview": { contextWindow: 256000, maxOutputTokens: 64000 },
+    "ring-2.6-1t": { contextWindow: 262000, maxOutputTokens: 66000 }
   },
   [ZEN_VENDOR]: {
     "deepseek-v4-flash-free": { contextWindow: 1000000, maxOutputTokens: 384000 },
@@ -189,7 +202,6 @@ const MODEL_LIMITS_BY_PROVIDER: Record<ProviderDefinition["vendor"], Record<stri
     "qwen3.6-plus": { contextWindow: 262144, maxOutputTokens: 65536 },
     "qwen3.6-plus-free": { contextWindow: 262144, maxOutputTokens: 65536 },
     "qwen3.5-plus": { contextWindow: 262144, maxOutputTokens: 65536 },
-    "ring-2.6-1t-free": { contextWindow: 262000, maxOutputTokens: 66000 },
     "trinity-large-preview-free": { contextWindow: 131072, maxOutputTokens: 131072 },
     "nemotron-3-super-free": { contextWindow: 204800, maxOutputTokens: 128000 },
     "big-pickle": { contextWindow: 200000, maxOutputTokens: 128000 }
@@ -210,6 +222,8 @@ type CopilotCompatibleCapabilities = vscode.LanguageModelChatCapabilities & {
 const CAPACITY_LIMITED_MODEL_NOTES: Record<string, string> = {
   "qwen3.6-plus-free": "Free relaunch with limited GPU capacity. Stable for short prompts; bursty traffic or very large tool catalogs may return 5xx — retry or fall back to 'deepseek-v4-flash-free' / 'minimax-m2.5-free'. Paid 'qwen3.6-plus' has no quota."
 };
+
+let deprecatedOpenCodeModelIdsPromise: Promise<Set<string>> | undefined;
 
 const VISION_CAPABLE_MODELS = new Set([
   "minimax-m2.7",
@@ -503,12 +517,13 @@ class OpenCodeProvider implements vscode.LanguageModelChatProvider<OpenCodeModel
 
     try {
       if (model.endpointKind === "messages") {
-        await streamAnthropicMessages(this.definition.messagesUrl, apiKey, rawModelId, apiMessages, options, settings, limits, progress, token, this.getOutputChannel());
+        await streamAnthropicMessages(this.definition.messagesUrl, this.definition.displayName, apiKey, rawModelId, apiMessages, options, settings, limits, progress, token, this.getOutputChannel());
         return;
       }
 
       await streamChatCompletions(
         this.definition.chatCompletionsUrl,
+        this.definition.displayName,
         apiKey,
         rawModelId,
         apiMessages,
@@ -556,11 +571,34 @@ class OpenCodeProvider implements vscode.LanguageModelChatProvider<OpenCodeModel
         .filter((id): id is string => typeof id === "string" && id.length > 0)
         .filter((id) => this.definition.filterModel?.(id) ?? true);
 
-      return ids?.length ? ids : this.definition.fallbackModels;
+      return this.filterAvailableModels(ids?.length ? ids : this.definition.fallbackModels);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       vscode.window.showWarningMessage(`Could not fetch ${this.definition.displayName} model list. Using bundled model list. ${message}`);
-      return this.definition.fallbackModels;
+      return this.filterAvailableModels(this.definition.fallbackModels);
+    }
+  }
+
+  private async filterAvailableModels(modelIds: string[]): Promise<string[]> {
+    const uniqueModelIds = [...new Set(modelIds)];
+
+    try {
+      const deprecatedModelIds = await fetchDeprecatedOpenCodeModelIds();
+      const filteredModelIds = uniqueModelIds.filter((modelId) =>
+        !KNOWN_UNAVAILABLE_MODEL_IDS.has(modelId)
+        && !deprecatedModelIds.has(modelId)
+      );
+
+      const removedModelIds = uniqueModelIds.filter((modelId) => !filteredModelIds.includes(modelId));
+      if (removedModelIds.length) {
+        this.log(`Filtered unavailable/deprecated models: ${removedModelIds.join(", ")}`);
+      }
+
+      return filteredModelIds;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.log(`Could not fetch model status metadata from models.dev. Applying local unavailable model filter only. ${message}`);
+      return uniqueModelIds.filter((modelId) => !KNOWN_UNAVAILABLE_MODEL_IDS.has(modelId));
     }
   }
 
@@ -571,8 +609,33 @@ function getConfiguredApiKey(options?: { configuration?: LanguageModelConfigurat
   return typeof configuredApiKey === "string" && configuredApiKey.trim() ? configuredApiKey.trim() : undefined;
 }
 
+async function fetchDeprecatedOpenCodeModelIds(): Promise<Set<string>> {
+  deprecatedOpenCodeModelIdsPromise ??= (async () => {
+    const response = await fetch(MODELS_DEV_API_URL);
+
+    if (!response.ok) {
+      throw new Error(`models.dev request failed (${response.status}): ${response.statusText}`);
+    }
+
+    const data = await response.json() as ModelsDevResponse;
+    const models = data.opencode?.models ?? {};
+    const deprecatedModelIds = new Set<string>();
+
+    for (const [modelId, model] of Object.entries(models)) {
+      if (model.status === "deprecated") {
+        deprecatedModelIds.add(modelId);
+      }
+    }
+
+    return deprecatedModelIds;
+  })();
+
+  return deprecatedOpenCodeModelIdsPromise;
+}
+
 async function streamChatCompletions(
   url: string,
+  providerDisplayName: string,
   apiKey: string,
   modelId: string,
   messages: ApiMessage[],
@@ -604,6 +667,7 @@ async function streamChatCompletions(
 
   await streamOpenCodeResponse(
     url,
+    providerDisplayName,
     apiKey,
     {
       model: modelId,
@@ -632,6 +696,7 @@ async function streamChatCompletions(
 
 async function streamAnthropicMessages(
   url: string,
+  providerDisplayName: string,
   apiKey: string,
   modelId: string,
   messages: ApiMessage[],
@@ -647,6 +712,7 @@ async function streamAnthropicMessages(
 
   await streamOpenCodeResponse(
     url,
+    providerDisplayName,
     apiKey,
     {
       model: modelId,
@@ -694,6 +760,7 @@ function anthropicToolChoice(mode: vscode.LanguageModelChatToolMode): { type: "a
 
 async function streamOpenCodeResponse(
   url: string,
+  providerDisplayName: string,
   apiKey: string,
   body: unknown,
   progress: vscode.Progress<vscode.LanguageModelResponsePart>,
@@ -727,7 +794,7 @@ async function streamOpenCodeResponse(
       const modelHint = modelId ? ` model=${modelId}` : "";
       const sizeHint = ` payloadBytes=${payload.length}`;
       const capacityHint = (modelId && CAPACITY_LIMITED_MODEL_NOTES[modelId] && response.status >= 500) ? ` — ${CAPACITY_LIMITED_MODEL_NOTES[modelId]}` : "";
-      throw new Error(`OpenCode Go API request failed (${response.status})${modelHint}${sizeHint}${capacityHint}: ${detail || response.statusText}`);
+      throw new Error(`${providerDisplayName} API request failed (${response.status})${modelHint}${sizeHint}${capacityHint}: ${detail || response.statusText}`);
     }
 
     const contentType = response.headers.get("content-type") ?? "";
