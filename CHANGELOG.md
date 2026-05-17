@@ -10,11 +10,12 @@ All notable changes to the **OpenCode Go BYOK Provider** extension are documente
 
 - Added `opencodego.freeOnly` to control whether the OpenCode Zen provider exposes only free models or the full Zen catalog.
 - Added native per-model Thinking configuration schema for DeepSeek, GLM, Kimi, and Qwen models.
+- Added `reasoningEffort` support for Thinking controls and request logging for selected model configuration and final Thinking payload.
 
 ### Fixed
 
-- Bumped model metadata revision to force VS Code to refresh model-picker configuration metadata.
-- Aligned the primary Thinking field with VS Code's `reasoningEffort` configuration path and added request logging for selected model configuration and final Thinking payload.
+- Preserved numeric model versions in picker labels, so Zen model IDs like `claude-opus-4-5` now display as `Claude Opus 4.5` instead of `Claude Opus 4 5`.
+- Bumped model metadata revision to force VS Code to refresh model-picker configuration metadata, including corrected model labels.
 - Filter deprecated OpenCode models using the models.dev registry before registering them with VS Code, with a local safety list for free models that now return provider 404s (`ring-2.6-1t-free`, `trinity-large-preview-free`).
 - Removed stale unavailable models from bundled fallback lists so offline fallback does not reintroduce models that can no longer serve requests.
 - API errors now use the active provider display name instead of always saying `OpenCode Go`.
