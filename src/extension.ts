@@ -25,7 +25,7 @@ const KNOWN_UNAVAILABLE_MODEL_IDS = new Set([
   "trinity-large-preview-free"
 ]);
 // Bump this when we need to force VS Code picker metadata refresh.
-const MODEL_METADATA_REVISION = "thinking-2026-05-17-d";
+const MODEL_METADATA_REVISION = "thinking-2026-05-17-e";
 
 const PROVIDERS: Record<ProviderDefinition["vendor"], ProviderDefinition> = {
   [GO_VENDOR]: {
@@ -278,8 +278,52 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand("opencodego.diagnostics", () => goProvider.showDiagnostics()),
     vscode.commands.registerCommand("opencodego.setApiKey", () => goProvider.setApiKey()),
     vscode.commands.registerCommand("opencodezen.diagnostics", () => zenProvider.showDiagnostics()),
+    vscode.commands.registerCommand("opencodego.modelPickerDiagnostics", () => showModelPickerDiagnostics()),
     vscode.commands.registerCommand("opencodego.setThinkingEffort", () => showThinkingEffortPicker())
   );
+
+  void warmModelPickerMetadata();
+}
+
+async function warmModelPickerMetadata(): Promise<void> {
+  await Promise.allSettled([
+    vscode.lm.selectChatModels({ vendor: GO_VENDOR }),
+    vscode.lm.selectChatModels({ vendor: ZEN_VENDOR })
+  ]);
+}
+
+async function showModelPickerDiagnostics(): Promise<void> {
+  const vendors = [GO_VENDOR, ZEN_VENDOR, "copilot"];
+  const sections: string[] = [];
+
+  for (const vendor of vendors) {
+    const models = await vscode.lm.selectChatModels({ vendor });
+    sections.push(`## vendor: ${vendor}`, "", `models: ${models.length}`, "");
+    for (const model of models) {
+      const internalModel = model as unknown as { configurationSchema?: unknown; detail?: unknown };
+      const schema = internalModel.configurationSchema;
+      sections.push(
+        `### ${model.name}`,
+        "",
+        `- id: \`${model.id}\``,
+        `- family: \`${model.family}\``,
+        `- version: \`${model.version}\``,
+        `- vendor: \`${model.vendor}\``,
+        `- detail: \`${typeof internalModel.detail === "string" ? internalModel.detail : ""}\``,
+        `- schema:`,
+        "```json",
+        JSON.stringify(schema ?? null, null, 2),
+        "```",
+        ""
+      );
+    }
+  }
+
+  const doc = await vscode.workspace.openTextDocument({
+    content: ["# OpenCode Model Picker Diagnostics", "", ...sections].join("\n"),
+    language: "markdown"
+  });
+  await vscode.window.showTextDocument(doc, vscode.ViewColumn.Beside);
 }
 
 async function showThinkingEffortPicker(): Promise<void> {
@@ -456,6 +500,8 @@ class OpenCodeProvider implements vscode.LanguageModelChatProvider<OpenCodeModel
       `  advertisedMaxOutputTokens: ${limits.advertisedMaxOutputTokens}`,
       `  advertisedContextWindow: ${limits.advertisedContextWindow}`,
       `  apiMaxOutputTokens: ${limits.maxOutputTokens}`,
+      `  thinkingFamily: ${thinkingFamily(rawModelId) ?? "none"}`,
+      `  configurationSchema: ${JSON.stringify((model as unknown as { configurationSchema?: unknown }).configurationSchema ?? null)}`,
       ...(hasExplicitModelLimits(rawModelId, this.definition.vendor) ? [] : ["  limits: using default fallback"])
       ].join("\n");
     });
@@ -558,8 +604,9 @@ class OpenCodeProvider implements vscode.LanguageModelChatProvider<OpenCodeModel
       thinking: applyRequestThinkingOverride(rawModelId, baseSettings.thinking, requestOverride)
     };
     const limits = modelLimits(rawModelId, settings, model.provider.vendor);
+    const thinkingPayload = buildThinkingPayload(rawModelId, settings.thinking);
 
-    this.log(`Request: model=${model.id} rawModel=${rawModelId} endpoint=${model.endpointKind} messages=${apiMessages.length}`);
+    this.log(`Request: model=${model.id} rawModel=${rawModelId} endpoint=${model.endpointKind} messages=${apiMessages.length} modelConfiguration=${JSON.stringify(pickThinkingModelConfiguration(requestOverride))} thinking=${JSON.stringify(settings.thinking)} thinkingPayload=${JSON.stringify(thinkingPayload)}`);
     if (settings.debugReasoning) {
       this.log("Reasoning debug is enabled. Provider reasoning_content will be written to this output channel when available.");
     }
@@ -1400,21 +1447,27 @@ function thinkingFamily(modelId: string): ThinkingFamily {
   return null;
 }
 
-// Per-family JSON-Schema describing the inline submenu rendered by Copilot
-// Chat (VS Code 1.118+ LM API). `enumItemLabels` + `group: 'navigation'`
-// surface the options as a picker (e.g. "Thinking Effort: Low/High/...").
+// Per-family JSON-Schema describing the native model-picker controls rendered
+// by VS Code 1.120. Keep the primary property name aligned with VS Code's
+// BYOK reasoning control so builds with narrower assumptions still recognize it.
 function modelConfigurationSchema(modelId: string): vscode.LanguageModelConfigurationSchema | undefined {
   const family = thinkingFamily(modelId);
   if (!family) return undefined;
 
   if (family === "deepseek") {
     return {
+      type: "object",
       properties: {
         reasoningEffort: {
           type: "string",
-          title: "Thinking",
+          title: "Thinking Effort",
           enum: ["off", "high", "max"],
           enumItemLabels: ["Off", "High", "Max"],
+          enumDescriptions: [
+            "Fastest responses",
+            "More reasoning",
+            "Maximum reasoning"
+          ],
           default: "off",
           group: "navigation"
         }
@@ -1424,12 +1477,17 @@ function modelConfigurationSchema(modelId: string): vscode.LanguageModelConfigur
 
   if (family === "glm" || family === "kimi") {
     return {
+      type: "object",
       properties: {
-        thinkingMode: {
+        reasoningEffort: {
           type: "string",
-          title: "Thinking",
-          enum: ["on", "off"],
-          enumItemLabels: ["On", "Off"],
+          title: "Thinking Effort",
+          enum: ["off", "on"],
+          enumItemLabels: ["Off", "On"],
+          enumDescriptions: [
+            "Fastest responses",
+            "Enable thinking"
+          ],
           default: "off",
           group: "navigation"
         }
@@ -1439,12 +1497,18 @@ function modelConfigurationSchema(modelId: string): vscode.LanguageModelConfigur
 
   // qwen
   return {
+    type: "object",
     properties: {
-      thinkingMode: {
+      reasoningEffort: {
         type: "string",
-        title: "Thinking",
-        enum: ["auto", "on", "off"],
-        enumItemLabels: ["Auto", "On", "Off"],
+        title: "Thinking Effort",
+        enum: ["off", "auto", "on"],
+        enumItemLabels: ["Off", "Auto", "On"],
+        enumDescriptions: [
+          "Fastest responses",
+          "Model decides",
+          "Enable thinking"
+        ],
         default: "off",
         group: "navigation"
       },
@@ -1453,8 +1517,14 @@ function modelConfigurationSchema(modelId: string): vscode.LanguageModelConfigur
         title: "Thinking Budget",
         enum: ["auto", "4096", "16384", "32768", "81920"],
         enumItemLabels: ["Auto", "4K", "16K", "32K", "80K"],
-        default: "auto",
-        group: "navigation"
+        enumDescriptions: [
+          "Provider default",
+          "Small budget",
+          "Medium budget",
+          "Large budget",
+          "Maximum budget"
+        ],
+        default: "auto"
       }
     }
   };
@@ -1485,12 +1555,21 @@ function applyRequestThinkingOverride(
   if (family === "glm" && typeof thinkingMode === "string") {
     if (thinkingMode === "on" || thinkingMode === "off") next.glm = thinkingMode;
   }
+  if (family === "glm" && typeof reasoningEffort === "string") {
+    if (reasoningEffort === "on" || reasoningEffort === "off") next.glm = reasoningEffort;
+  }
   if (family === "kimi" && typeof thinkingMode === "string") {
     if (thinkingMode === "on" || thinkingMode === "off") next.kimi = thinkingMode;
+  }
+  if (family === "kimi" && typeof reasoningEffort === "string") {
+    if (reasoningEffort === "on" || reasoningEffort === "off") next.kimi = reasoningEffort;
   }
   if (family === "qwen") {
     if (typeof thinkingMode === "string" && (thinkingMode === "auto" || thinkingMode === "on" || thinkingMode === "off")) {
       next.qwen = thinkingMode;
+    }
+    if (typeof reasoningEffort === "string" && (reasoningEffort === "auto" || reasoningEffort === "on" || reasoningEffort === "off")) {
+      next.qwen = reasoningEffort;
     }
     if (typeof thinkingBudget === "string" && ["auto", "4096", "16384", "32768", "81920"].includes(thinkingBudget)) {
       next.qwenBudget = thinkingBudget as ThinkingSettings["qwenBudget"];
@@ -1509,6 +1588,18 @@ function getRequestModelConfiguration(options: vscode.ProvideLanguageModelChatRe
     configuration?: Record<string, unknown>;
   };
   return opts.modelConfiguration ?? opts.configuration;
+}
+
+function pickThinkingModelConfiguration(override: Record<string, unknown> | undefined): Record<string, unknown> | undefined {
+  if (!override) return undefined;
+  const picked: Record<string, unknown> = {};
+  for (const key of ["reasoningEffort", "thinkingMode", "thinkingBudget"]) {
+    const value = override[key];
+    if (typeof value === "string") {
+      picked[key] = value;
+    }
+  }
+  return Object.keys(picked).length ? picked : undefined;
 }
 
 function getSettings(): ApiSettings {
@@ -1535,7 +1626,7 @@ function getSettings(): ApiSettings {
 function buildThinkingPayload(modelId: string, thinking: ThinkingSettings): Record<string, unknown> {
   if (/^deepseek-/i.test(modelId)) {
     if (thinking.deepseek === "off") {
-      return { reasoning_effort: "low" };
+      return {};
     }
     return { reasoning_effort: thinking.deepseek };
   }

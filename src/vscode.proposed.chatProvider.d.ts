@@ -92,9 +92,11 @@ declare module 'vscode' {
 	 * A [JSON Schema](https://json-schema.org) describing configuration options for a language model.
 	 */
 	export type LanguageModelConfigurationSchema = {
+		readonly type?: string;
 		readonly properties?: {
 			readonly [key: string]: Record<string, any> & {
 				readonly enumItemLabels?: string[];
+				readonly enumDescriptions?: string[];
 				readonly group?: string;
 			};
 		};
