@@ -16,6 +16,8 @@ All notable changes to the **OpenCode Go BYOK Provider** extension are documente
 
 - Preserved numeric model versions in picker labels, so Zen model IDs like `claude-opus-4-5` now display as `Claude Opus 4.5` instead of `Claude Opus 4 5`.
 - Bumped model metadata revision to force VS Code to refresh model-picker configuration metadata, including corrected model labels.
+- Sanitized Copilot tool schemas before forwarding them to OpenCode providers, avoiding Moonshot/Kimi 400 errors caused by `$ref` schemas with sibling descriptions.
+- Sent Qwen chat requests through the OpenCode chat-completions endpoint while preserving hybrid OpenAI/Anthropic stream parsing, avoiding the `/messages` auth path that returned `Missing API key`.
 - Filter deprecated OpenCode models using the models.dev registry before registering them with VS Code, with a local safety list for free models that now return provider 404s (`ring-2.6-1t-free`, `trinity-large-preview-free`).
 - Removed stale unavailable models from bundled fallback lists so offline fallback does not reintroduce models that can no longer serve requests.
 - API errors now use the active provider display name instead of always saying `OpenCode Go`.

@@ -617,6 +617,24 @@ class OpenCodeProvider implements vscode.LanguageModelChatProvider<OpenCodeModel
         return;
       }
 
+      if (isQwenModel(rawModelId)) {
+        await streamChatCompletionsWithAnthropicStream(
+          this.definition.chatCompletionsUrl,
+          this.definition.displayName,
+          apiKey,
+          rawModelId,
+          apiMessages,
+          options,
+          settings,
+          limits,
+          progress,
+          token,
+          this.getOutputChannel()
+        );
+        this.log(`Request completed: model=${model.id}`);
+        return;
+      }
+
       await streamChatCompletions(
         this.definition.chatCompletionsUrl,
         this.definition.displayName,
@@ -786,6 +804,66 @@ async function streamChatCompletions(
   }
 }
 
+async function streamChatCompletionsWithAnthropicStream(
+  url: string,
+  providerDisplayName: string,
+  apiKey: string,
+  modelId: string,
+  messages: ApiMessage[],
+  options: vscode.ProvideLanguageModelChatResponseOptions,
+  settings: ApiSettings,
+  limits: ModelLimits,
+  progress: vscode.Progress<vscode.LanguageModelResponsePart>,
+  token: vscode.CancellationToken,
+  output: vscode.OutputChannel
+): Promise<void> {
+  const openAiExtractor = new OpenAiResponseExtractor(undefined, (reasoningContent) => {
+    if (settings.debugReasoning) {
+      output.appendLine("[reasoning_content]");
+      output.appendLine(reasoningContent);
+      output.appendLine("[/reasoning_content]");
+    }
+  });
+  const tools = mapOpenAiTools(options.tools);
+  const anthropicExtractor = new AnthropicResponseExtractor();
+  const thinkingPayload = buildThinkingPayload(modelId, settings.thinking);
+
+  await streamOpenCodeResponse(
+    url,
+    providerDisplayName,
+    apiKey,
+    {
+      model: modelId,
+      messages,
+      temperature: settings.temperature,
+      max_tokens: limits.maxOutputTokens,
+      stream: true,
+      ...thinkingPayload,
+      ...(tools.length ? { tools, tool_choice: toolChoice(options.toolMode) } : {})
+    },
+    progress,
+    token,
+    (data) => {
+      const openAiParts = openAiExtractor.extractStreamParts(data);
+      return openAiParts.length ? openAiParts : anthropicExtractor.extractStreamParts(data);
+    },
+    (data) => {
+      const openAiParts = extractChatCompletionParts(data);
+      return openAiParts.length ? openAiParts : extractAnthropicParts(data);
+    },
+    output,
+    settings.debugReasoning
+  );
+
+  openAiExtractor.flushReasoningFallback(progress);
+  const emittedText = openAiExtractor.emittedText + anthropicExtractor.emittedText;
+  output.appendLine(`[stream-summary model=${modelId}] textChars=${emittedText} toolCalls=${openAiExtractor.emittedTools} reasoningChars=${openAiExtractor.reasoningChars}`);
+  if (emittedText === 0 && openAiExtractor.emittedTools === 0) {
+    output.appendLine(`[warn] empty response from model=${modelId} after hybrid Qwen stream parsing. Enable opencodego.debugReasoning to inspect raw SSE.`);
+    output.show(true);
+  }
+}
+
 async function streamAnthropicMessages(
   url: string,
   providerDisplayName: string,
@@ -835,7 +913,7 @@ function mapOpenAiTools(tools: readonly vscode.LanguageModelChatTool[] | undefin
     function: {
       name: tool.name,
       description: tool.description,
-      parameters: tool.inputSchema ?? { type: "object", properties: {} }
+      parameters: sanitizeToolSchema(tool.inputSchema)
     }
   }));
 }
@@ -844,8 +922,91 @@ function mapAnthropicTools(tools: readonly vscode.LanguageModelChatTool[] | unde
   return (tools ?? []).map((tool) => ({
     name: tool.name,
     description: tool.description,
-    input_schema: tool.inputSchema ?? { type: "object", properties: {} }
+    input_schema: sanitizeToolSchema(tool.inputSchema)
   }));
+}
+
+function sanitizeToolSchema(schema: unknown): object {
+  const root = isRecord(schema) ? schema : { type: "object", properties: {} };
+  const sanitized = sanitizeJsonSchemaNode(root, root, new Set());
+  if (!isRecord(sanitized)) {
+    return { type: "object", properties: {} };
+  }
+
+  return {
+    type: sanitized.type === "object" ? "object" : "object",
+    properties: isRecord(sanitized.properties) ? sanitized.properties : {},
+    ...(Array.isArray(sanitized.required) ? { required: sanitized.required } : {})
+  };
+}
+
+function sanitizeJsonSchemaNode(value: unknown, root: Record<string, unknown>, seenRefs: Set<string>): unknown {
+  if (Array.isArray(value)) {
+    return value.map((item) => sanitizeJsonSchemaNode(item, root, seenRefs));
+  }
+
+  if (!isRecord(value)) {
+    return value;
+  }
+
+  const ref = typeof value.$ref === "string" ? value.$ref : undefined;
+  if (ref?.startsWith("#/") && !seenRefs.has(ref)) {
+    const target = resolveJsonPointer(root, ref);
+    if (target !== undefined) {
+      const nextSeenRefs = new Set(seenRefs);
+      nextSeenRefs.add(ref);
+      const siblings = Object.fromEntries(Object.entries(value).filter(([key]) => key !== "$ref"));
+      const resolved = sanitizeJsonSchemaNode(target, root, nextSeenRefs);
+      return isRecord(resolved)
+        ? sanitizeJsonSchemaNode({ ...resolved, ...siblings }, root, nextSeenRefs)
+        : sanitizeJsonSchemaNode(siblings, root, nextSeenRefs);
+    }
+  }
+
+  const result: Record<string, unknown> = {};
+  for (const [key, child] of Object.entries(value)) {
+    if (key === "$schema" || key === "$id" || key === "$ref" || key === "$defs" || key === "definitions") {
+      continue;
+    }
+
+    if (key === "properties" && isRecord(child)) {
+      result.properties = Object.fromEntries(
+        Object.entries(child).map(([propertyName, propertySchema]) => [
+          propertyName,
+          sanitizeJsonSchemaNode(propertySchema, root, seenRefs)
+        ])
+      );
+      continue;
+    }
+
+    if (key === "items" || key === "additionalProperties") {
+      result[key] = sanitizeJsonSchemaNode(child, root, seenRefs);
+      continue;
+    }
+
+    if ((key === "anyOf" || key === "oneOf" || key === "allOf") && Array.isArray(child)) {
+      result[key] = child.map((item) => sanitizeJsonSchemaNode(item, root, seenRefs));
+      continue;
+    }
+
+    if (["type", "description", "enum", "required", "minimum", "maximum", "minLength", "maxLength", "minItems", "maxItems"].includes(key)) {
+      result[key] = child;
+    }
+  }
+
+  return result;
+}
+
+function resolveJsonPointer(root: Record<string, unknown>, pointer: string): unknown {
+  return pointer
+    .slice(2)
+    .split("/")
+    .reduce<unknown>((current, segment) => {
+      if (!isRecord(current)) {
+        return undefined;
+      }
+      return current[segment.replace(/~1/g, "/").replace(/~0/g, "~")];
+    }, root);
 }
 
 function toolChoice(mode: vscode.LanguageModelChatToolMode): "auto" | "required" {
@@ -1379,6 +1540,10 @@ function extractReasoningFromDelta(delta: Record<string, unknown>): string {
 }
 
 class AnthropicResponseExtractor {
+  private emittedTextLength = 0;
+
+  get emittedText(): number { return this.emittedTextLength; }
+
   extractStreamParts(data: unknown): vscode.LanguageModelResponsePart[] {
     if (!isRecord(data)) {
       return [];
@@ -1386,6 +1551,7 @@ class AnthropicResponseExtractor {
 
     const delta = data.delta;
     if (isRecord(delta) && typeof delta.text === "string") {
+      this.emittedTextLength += delta.text.length;
       return [new vscode.LanguageModelTextPart(delta.text)];
     }
 
@@ -1658,6 +1824,10 @@ function buildThinkingPayload(modelId: string, thinking: ThinkingSettings): Reco
   return {};
 }
 
+function isQwenModel(modelId: string): boolean {
+  return /^qwen3(?:\.|-)/i.test(modelId);
+}
+
 function modelLimits(
   modelId: string,
   settings = getSettings(),
@@ -1717,13 +1887,6 @@ function modelCapabilities(modelId: string): CopilotCompatibleCapabilities {
 
 function modelEndpointKind(modelId: string, provider: ProviderDefinition): OpenCodeModel["endpointKind"] {
   if (provider.vendor === GO_VENDOR && modelId.startsWith("minimax-m2.")) {
-    return "messages";
-  }
-
-  // Qwen3.x via OpenCode gateway returns Anthropic-style SSE (event:message_start,
-  // content_block_delta, text_delta) even on the /chat/completions endpoint, so
-  // route them through the /messages parser to actually capture the output.
-  if (/^qwen3(?:\.|-)/i.test(modelId)) {
     return "messages";
   }
 
