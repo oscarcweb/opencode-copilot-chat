@@ -18,6 +18,12 @@ interface ProviderDefinition {
   filterModel?: (modelId: string) => boolean;
 }
 
+type ModelEndpointKind =
+  | "chat-completions"
+  | "messages"
+  | "responses"
+  | "google";
+
 const FREE_ZEN_MODEL_IDS = new Set(["big-pickle"]);
 const MODELS_DEV_API_URL = "https://models.dev/api.json";
 const KNOWN_UNAVAILABLE_MODEL_IDS = new Set([
@@ -85,7 +91,7 @@ const PROVIDERS: Record<ProviderDefinition["vendor"], ProviderDefinition> = {
 type ApiRole = "user" | "assistant" | "tool";
 
 interface OpenCodeModel extends vscode.LanguageModelChatInformation {
-  endpointKind: "chat-completions" | "messages";
+  endpointKind: ModelEndpointKind;
   provider: ProviderDefinition;
   rawModelId?: string;
   category?: {
@@ -239,6 +245,12 @@ interface ResolvedModelMetadata extends BaseModelLimits {
   reasoning: boolean;
   status?: string;
   source: "models.dev" | "live" | "fallback" | "default";
+}
+
+interface ModelRoutingFields {
+  endpointKind: ModelEndpointKind;
+  endpointUrl: string;
+  sdkPackage?: string;
 }
 
 // Copilot surfaces combine input/output metadata differently across views.
@@ -687,6 +699,7 @@ class OpenCodeProvider implements vscode.LanguageModelChatProvider<OpenCodeModel
 
     return models.map((modelId) => {
       const metadata = this.resolveModelMetadata(modelId, metadataSnapshot);
+      const routing = resolveModelRouting(modelId, this.definition);
       const effectiveModelId = toEffectiveModelId(modelId, this.definition.vendor);
       const limits = modelLimits(metadata, settings);
       this.apiKeysByModelId.set(modelId, apiKey);
@@ -715,14 +728,14 @@ class OpenCodeProvider implements vscode.LanguageModelChatProvider<OpenCodeModel
         maxInputTokens: limits.advertisedMaxInputTokens,
         maxOutputTokens: limits.advertisedMaxOutputTokens,
         capabilities: modelCapabilities(metadata),
-        endpointKind: modelEndpointKind(modelId, this.definition),
+        endpointKind: routing.endpointKind,
         provider: this.definition,
         // Inline so Copilot Chat picks up the Thinking submenu directly
         // (parity with zelosleone/Opencode-Go-For-Copilot pattern).
         ...(configurationSchema ? { configurationSchema } : {})
       };
 
-      this.log(`Model registered: id=${info.id} family=${info.family} metadataSource=${metadata.source} configurationSchema=${configurationSchema ? JSON.stringify(configurationSchema) : "none"}`);
+      this.log(`Model registered: id=${info.id} family=${info.family} metadataSource=${metadata.source} endpointKind=${routing.endpointKind} endpointUrl=${routing.endpointUrl} configurationSchema=${configurationSchema ? JSON.stringify(configurationSchema) : "none"}`);
 
       return info;
     });
@@ -756,6 +769,7 @@ class OpenCodeProvider implements vscode.LanguageModelChatProvider<OpenCodeModel
     };
     const metadataSnapshot = await this.getMetadataSnapshot();
     const metadata = this.resolveModelMetadata(rawModelId, metadataSnapshot);
+    const routing = resolveModelRouting(rawModelId, this.definition);
     const limits = modelLimits(metadata, settings);
     const thinkingPayload = buildThinkingPayload(rawModelId, settings.thinking);
     const requestHeaders = buildOpenCodeRequestHeaders(
@@ -764,20 +778,39 @@ class OpenCodeProvider implements vscode.LanguageModelChatProvider<OpenCodeModel
       rawModelId,
     );
 
-    this.log(`Request: model=${model.id} rawModel=${rawModelId} endpoint=${model.endpointKind} metadataSource=${metadata.source} messages=${apiMessages.length} session=${requestHeaders["x-opencode-session"]} request=${requestHeaders["x-opencode-request"]} modelConfiguration=${JSON.stringify(pickThinkingModelConfiguration(requestOverride))} thinking=${JSON.stringify(settings.thinking)} thinkingPayload=${JSON.stringify(thinkingPayload)}`);
+    this.log(`Request: model=${model.id} rawModel=${rawModelId} endpoint=${routing.endpointKind} metadataSource=${metadata.source} messages=${apiMessages.length} session=${requestHeaders["x-opencode-session"]} request=${requestHeaders["x-opencode-request"]} modelConfiguration=${JSON.stringify(pickThinkingModelConfiguration(requestOverride))} thinking=${JSON.stringify(settings.thinking)} thinkingPayload=${JSON.stringify(thinkingPayload)}`);
     if (settings.debugReasoning) {
       this.log("Reasoning debug is enabled. Provider reasoning_content will be written to this output channel when available.");
     }
 
     try {
-      if (model.endpointKind === "messages") {
-        await streamAnthropicMessages(this.definition.messagesUrl, this.definition.displayName, apiKey, rawModelId, apiMessages, options, settings, limits, requestHeaders, progress, token, this.getOutputChannel());
+      if (routing.endpointKind === "messages") {
+        await streamAnthropicMessages(routing.endpointUrl, this.definition.displayName, apiKey, rawModelId, apiMessages, options, settings, limits, requestHeaders, progress, token, this.getOutputChannel());
+        return;
+      }
+
+      if (routing.endpointKind === "responses") {
+        await streamResponsesApi(routing.endpointUrl, this.definition.displayName, apiKey, rawModelId, apiMessages, options, settings, limits, requestHeaders, progress, token, this.getOutputChannel(), (toolCallIds, reasoningContent) => {
+          for (const toolCallId of toolCallIds) {
+            this.reasoningContentByToolCallId.set(toolCallId, reasoningContent);
+          }
+        });
+        this.log(`Request completed: model=${model.id}`);
+        return;
+      }
+
+      if (routing.endpointKind === "google") {
+        await streamGoogleGenerateContent(routing.endpointUrl, this.definition.displayName, apiKey, rawModelId, apiMessages, options, settings, limits, requestHeaders, progress, token, this.getOutputChannel(), (toolCallIds, reasoningContent) => {
+          for (const toolCallId of toolCallIds) {
+            this.reasoningContentByToolCallId.set(toolCallId, reasoningContent);
+          }
+        });
         return;
       }
 
       if (isQwenModel(rawModelId)) {
         await streamChatCompletionsWithAnthropicStream(
-          this.definition.chatCompletionsUrl,
+          routing.endpointUrl,
           this.definition.displayName,
           apiKey,
           rawModelId,
@@ -795,7 +828,7 @@ class OpenCodeProvider implements vscode.LanguageModelChatProvider<OpenCodeModel
       }
 
       await streamChatCompletions(
-        this.definition.chatCompletionsUrl,
+        routing.endpointUrl,
         this.definition.displayName,
         apiKey,
         rawModelId,
@@ -1146,6 +1179,657 @@ async function streamAnthropicMessages(
   );
 }
 
+async function streamResponsesApi(
+  url: string,
+  providerDisplayName: string,
+  apiKey: string,
+  modelId: string,
+  messages: ApiMessage[],
+  options: vscode.ProvideLanguageModelChatResponseOptions,
+  settings: ApiSettings,
+  limits: ModelLimits,
+  requestHeaders: Record<string, string>,
+  progress: vscode.Progress<vscode.LanguageModelResponsePart>,
+  token: vscode.CancellationToken,
+  output: vscode.OutputChannel,
+  onReasoningContent?: (toolCallIds: string[], reasoningContent: string) => void,
+): Promise<void> {
+  const extractor = new OpenAiResponseExtractor(onReasoningContent, (reasoningContent) => {
+    if (settings.debugReasoning) {
+      output.appendLine("[reasoning_content]");
+      output.appendLine(reasoningContent);
+      output.appendLine("[/reasoning_content]");
+    }
+  });
+
+  await streamOpenCodeResponse(
+    url,
+    providerDisplayName,
+    apiKey,
+    buildResponsesRequestBody(modelId, messages, options, settings, limits),
+    requestHeaders,
+    progress,
+    token,
+    (data) => extractor.extractStreamParts(normalizeResponsesStreamEvent(data)),
+    (data) => extractChatCompletionParts(normalizeResponsesFullResponse(data)),
+    output,
+    settings.debugReasoning,
+    settings.requestTimeoutMs,
+    settings.streamIdleTimeoutMs,
+  );
+
+  extractor.flushReasoningFallback(progress);
+  output.appendLine(`[stream-summary model=${modelId}] textChars=${extractor.emittedText} toolCalls=${extractor.emittedTools} reasoningChars=${extractor.reasoningChars}`);
+}
+
+async function streamGoogleGenerateContent(
+  url: string,
+  providerDisplayName: string,
+  apiKey: string,
+  modelId: string,
+  messages: ApiMessage[],
+  options: vscode.ProvideLanguageModelChatResponseOptions,
+  settings: ApiSettings,
+  limits: ModelLimits,
+  requestHeaders: Record<string, string>,
+  progress: vscode.Progress<vscode.LanguageModelResponsePart>,
+  token: vscode.CancellationToken,
+  output: vscode.OutputChannel,
+  onReasoningContent?: (toolCallIds: string[], reasoningContent: string) => void,
+): Promise<void> {
+  const extractor = new OpenAiResponseExtractor(onReasoningContent, (reasoningContent) => {
+    if (settings.debugReasoning) {
+      output.appendLine("[reasoning_content]");
+      output.appendLine(reasoningContent);
+      output.appendLine("[/reasoning_content]");
+    }
+  });
+
+  await streamOpenCodeResponse(
+    `${url}:streamGenerateContent?alt=sse`,
+    providerDisplayName,
+    apiKey,
+    buildGoogleGenerateContentBody(messages, options, settings, limits),
+    requestHeaders,
+    progress,
+    token,
+    (data) => extractor.extractStreamParts(normalizeGoogleStreamEvent(data)),
+    (data) => extractChatCompletionParts(normalizeGoogleFullResponse(data)),
+    output,
+    settings.debugReasoning,
+    settings.requestTimeoutMs,
+    settings.streamIdleTimeoutMs,
+    { "x-goog-api-key": apiKey },
+  );
+
+  extractor.flushReasoningFallback(progress);
+  output.appendLine(`[stream-summary model=${modelId}] textChars=${extractor.emittedText} toolCalls=${extractor.emittedTools} reasoningChars=${extractor.reasoningChars}`);
+}
+
+function mapResponsesTools(tools: readonly vscode.LanguageModelChatTool[] | undefined): Array<Record<string, unknown>> {
+  return (tools ?? []).map((tool) => ({
+    type: "function",
+    name: tool.name,
+    description: tool.description,
+    parameters: sanitizeToolSchema(tool.inputSchema),
+  }));
+}
+
+function buildResponsesRequestBody(
+  modelId: string,
+  messages: ApiMessage[],
+  options: vscode.ProvideLanguageModelChatResponseOptions,
+  settings: ApiSettings,
+  limits: ModelLimits,
+): Record<string, unknown> {
+  const input = messages.flatMap((message) => responsesInputItemsFromMessage(message));
+  const tools = mapResponsesTools(options.tools);
+
+  return {
+    model: modelId,
+    input,
+    max_output_tokens: limits.maxOutputTokens,
+    temperature: settings.temperature,
+    stream: true,
+    ...(tools.length ? { tools, tool_choice: toolChoice(options.toolMode) } : {}),
+    text: { verbosity: modelId === "gpt-5-codex" ? "medium" : "low" },
+  };
+}
+
+function responsesInputItemsFromMessage(message: ApiMessage): Array<Record<string, unknown>> {
+  if (message.role === "user") {
+    const content = responsesUserContent(message.content);
+    return content.length ? [{ role: "user", content }] : [];
+  }
+
+  if (message.role === "assistant") {
+    const items: Array<Record<string, unknown>> = [];
+    const text = responsesAssistantText(message.content);
+    if (text) {
+      items.push({ role: "assistant", content: [{ type: "output_text", text }] });
+    }
+
+    for (const toolCall of message.tool_calls ?? []) {
+      items.push({
+        type: "function_call",
+        id: toolCall.id,
+        call_id: toolCall.id,
+        name: toolCall.function.name,
+        arguments: toolCall.function.arguments,
+      });
+    }
+
+    return items;
+  }
+
+  if (message.role === "tool" && message.tool_call_id) {
+    return [{
+      type: "function_call_output",
+      call_id: message.tool_call_id,
+      output: typeof message.content === "string" ? message.content : JSON.stringify(message.content ?? ""),
+    }];
+  }
+
+  return [];
+}
+
+function responsesUserContent(content: ApiMessage["content"]): Array<Record<string, unknown>> {
+  if (typeof content === "string") {
+    return content ? [{ type: "input_text", text: content }] : [];
+  }
+
+  if (!Array.isArray(content)) {
+    return [];
+  }
+
+  return content.flatMap((part): Array<Record<string, unknown>> => {
+    if (part.type === "text" && typeof part.text === "string") {
+      return [{ type: "input_text", text: part.text }];
+    }
+
+    if (part.type === "image_url" && part.image_url?.url) {
+      return [{ type: "input_image", image_url: { url: part.image_url.url } }];
+    }
+
+    return [];
+  });
+}
+
+function responsesAssistantText(content: ApiMessage["content"]): string {
+  if (typeof content === "string") {
+    return content;
+  }
+
+  if (!Array.isArray(content)) {
+    return "";
+  }
+
+  return content
+    .filter((part): part is OpenAiContentPart & { text: string } => part.type === "text" && typeof part.text === "string")
+    .map((part) => part.text)
+    .join("");
+}
+
+function normalizeResponsesStreamEvent(data: unknown): unknown {
+  if (!isRecord(data)) {
+    return data;
+  }
+
+  const eventType = typeof data.type === "string" ? data.type : undefined;
+  if (!eventType) {
+    return data;
+  }
+
+  if (eventType === "response.output_text.delta") {
+    const delta = firstString(data.delta, data.text, data.output_text_delta);
+    return delta ? { choices: [{ index: 0, delta: { content: delta }, finish_reason: null }] } : { choices: [] };
+  }
+
+  if (eventType === "response.output_item.added") {
+    const item = data.item;
+    if (isRecord(item) && item.type === "function_call" && typeof item.name === "string") {
+      return {
+        choices: [{
+          index: 0,
+          delta: {
+            tool_calls: [{
+              index: typeof data.output_index === "number" ? data.output_index : 0,
+              id: firstString(item.call_id, item.id) ?? "",
+              type: "function",
+              function: { name: item.name, arguments: "" },
+            }],
+          },
+          finish_reason: null,
+        }],
+      };
+    }
+  }
+
+  if (eventType === "response.function_call_arguments.delta") {
+    const delta = firstString(data.delta, data.arguments_delta);
+    return delta ? {
+      choices: [{
+        index: 0,
+        delta: {
+          tool_calls: [{
+            index: typeof data.output_index === "number" ? data.output_index : 0,
+            function: { arguments: delta },
+          }],
+        },
+        finish_reason: null,
+      }],
+    } : { choices: [] };
+  }
+
+  if (eventType.includes("reasoning")) {
+    const reasoning = extractResponsesReasoningText(data);
+    return reasoning ? { choices: [{ index: 0, delta: { reasoning_content: reasoning }, finish_reason: null }] } : { choices: [] };
+  }
+
+  if (eventType === "response.completed") {
+    const response = isRecord(data.response) ? data.response : data;
+    const usage = normalizeResponsesUsage(response.usage);
+    return {
+      choices: [{
+        index: 0,
+        delta: {},
+        finish_reason: normalizeResponsesFinishReason(firstString(response.stop_reason, data.stop_reason)),
+      }],
+      ...(usage ? { usage } : {}),
+    };
+  }
+
+  return { choices: [] };
+}
+
+function normalizeResponsesFullResponse(data: unknown): unknown {
+  if (!isRecord(data) || Array.isArray(data.choices)) {
+    return data;
+  }
+
+  const response = isRecord(data.response) ? data.response : data;
+  const output = Array.isArray(response.output) ? response.output : [];
+  let text = "";
+  const toolCalls: Array<Record<string, unknown>> = [];
+
+  for (const item of output) {
+    if (!isRecord(item)) {
+      continue;
+    }
+
+    if (item.type === "message" && Array.isArray(item.content)) {
+      for (const part of item.content) {
+        if (isRecord(part) && part.type === "output_text" && typeof part.text === "string") {
+          text += part.text;
+        }
+      }
+      continue;
+    }
+
+    if (item.type === "function_call" && typeof item.name === "string") {
+      toolCalls.push({
+        id: firstString(item.call_id, item.id) ?? "",
+        type: "function",
+        function: {
+          name: item.name,
+          arguments: typeof item.arguments === "string" ? item.arguments : JSON.stringify(item.arguments ?? {}),
+        },
+      });
+    }
+  }
+
+  return {
+    choices: [{
+      index: 0,
+      message: {
+        ...(text ? { content: text } : {}),
+        ...(toolCalls.length ? { tool_calls: toolCalls } : {}),
+      },
+      finish_reason: normalizeResponsesFinishReason(firstString(response.stop_reason, response.finish_reason)),
+    }],
+    ...(normalizeResponsesUsage(response.usage) ? { usage: normalizeResponsesUsage(response.usage) } : {}),
+  };
+}
+
+function normalizeResponsesFinishReason(value: string | undefined): "stop" | "tool_calls" | "length" | "content_filter" | null {
+  if (!value) {
+    return null;
+  }
+
+  if (value === "completed" || value === "stop") {
+    return "stop";
+  }
+  if (value === "tool_call" || value === "tool_calls") {
+    return "tool_calls";
+  }
+  if (value === "max_output_tokens" || value === "length") {
+    return "length";
+  }
+  if (value.includes("filter") || value.includes("safety")) {
+    return "content_filter";
+  }
+
+  return null;
+}
+
+function normalizeResponsesUsage(usage: unknown): Record<string, unknown> | undefined {
+  if (!isRecord(usage)) {
+    return undefined;
+  }
+
+  const promptTokens = typeof usage.input_tokens === "number" ? usage.input_tokens : undefined;
+  const completionTokens = typeof usage.output_tokens === "number" ? usage.output_tokens : undefined;
+  const cachedTokens = isRecord(usage.input_tokens_details) && typeof usage.input_tokens_details.cached_tokens === "number"
+    ? usage.input_tokens_details.cached_tokens
+    : undefined;
+
+  if (promptTokens === undefined && completionTokens === undefined) {
+    return undefined;
+  }
+
+  return {
+    prompt_tokens: promptTokens,
+    completion_tokens: completionTokens,
+    total_tokens: promptTokens !== undefined && completionTokens !== undefined ? promptTokens + completionTokens : undefined,
+    ...(cachedTokens !== undefined ? { prompt_tokens_details: { cached_tokens: cachedTokens } } : {}),
+  };
+}
+
+function extractResponsesReasoningText(data: Record<string, unknown>): string {
+  const direct = firstString(data.delta, data.text, data.summary_text, data.output_text_delta);
+  if (direct) {
+    return direct;
+  }
+
+  const item = data.item;
+  if (!isRecord(item)) {
+    return "";
+  }
+
+  if (typeof item.text === "string") {
+    return item.text;
+  }
+
+  if (Array.isArray(item.summary)) {
+    return item.summary
+      .filter((part): part is Record<string, unknown> => isRecord(part) && typeof part.text === "string")
+      .map((part) => part.text as string)
+      .join("");
+  }
+
+  return "";
+}
+
+function buildGoogleGenerateContentBody(
+  messages: ApiMessage[],
+  options: vscode.ProvideLanguageModelChatResponseOptions,
+  settings: ApiSettings,
+  limits: ModelLimits,
+): Record<string, unknown> {
+  const tools = mapGoogleTools(options.tools);
+
+  return {
+    contents: googleContentsFromMessages(messages),
+    generationConfig: {
+      maxOutputTokens: limits.maxOutputTokens,
+      temperature: settings.temperature,
+    },
+    ...(tools.length ? { tools: [{ functionDeclarations: tools }], toolConfig: googleToolConfig(options.toolMode) } : {}),
+  };
+}
+
+function mapGoogleTools(tools: readonly vscode.LanguageModelChatTool[] | undefined): Array<Record<string, unknown>> {
+  return (tools ?? []).map((tool) => ({
+    name: tool.name,
+    description: tool.description,
+    parameters: sanitizeToolSchema(tool.inputSchema),
+  }));
+}
+
+function googleToolConfig(mode: vscode.LanguageModelChatToolMode): Record<string, unknown> {
+  return {
+    functionCallingConfig: {
+      mode: mode === vscode.LanguageModelChatToolMode.Required ? "ANY" : "AUTO",
+    },
+  };
+}
+
+function googleContentsFromMessages(messages: ApiMessage[]): Array<Record<string, unknown>> {
+  const toolNamesById = new Map<string, string>();
+  const contents: Array<Record<string, unknown>> = [];
+
+  for (const message of messages) {
+    if (message.role === "user") {
+      const parts = googleUserParts(message.content);
+      if (parts.length) {
+        contents.push({ role: "user", parts });
+      }
+      continue;
+    }
+
+    if (message.role === "assistant") {
+      const parts: Array<Record<string, unknown>> = [];
+      if (typeof message.reasoning_content === "string" && message.reasoning_content.trim()) {
+        parts.push({ text: message.reasoning_content, thought: true });
+      }
+      const text = responsesAssistantText(message.content);
+      if (text) {
+        parts.push({ text });
+      }
+      for (const toolCall of message.tool_calls ?? []) {
+        const args = parseToolInput(toolCall.function.arguments);
+        parts.push({ functionCall: { name: toolCall.function.name, args } });
+        toolNamesById.set(toolCall.id, toolCall.function.name);
+      }
+      if (parts.length) {
+        contents.push({ role: "model", parts });
+      }
+      continue;
+    }
+
+    if (message.role === "tool" && message.tool_call_id) {
+      const name = toolNamesById.get(message.tool_call_id) ?? "tool";
+      const content = typeof message.content === "string" ? message.content : JSON.stringify(message.content ?? "");
+      contents.push({
+        role: "user",
+        parts: [{
+          functionResponse: {
+            name,
+            response: { name, content },
+          },
+        }],
+      });
+    }
+  }
+
+  return contents;
+}
+
+function googleUserParts(content: ApiMessage["content"]): Array<Record<string, unknown>> {
+  if (typeof content === "string") {
+    return content ? [{ text: content }] : [];
+  }
+
+  if (!Array.isArray(content)) {
+    return [];
+  }
+
+  return content.flatMap((part): Array<Record<string, unknown>> => {
+    if (part.type === "text" && typeof part.text === "string") {
+      return [{ text: part.text }];
+    }
+
+    if (part.type === "image_url" && part.image_url?.url) {
+      const inlineData = dataUrlToInlineData(part.image_url.url);
+      return inlineData ? [{ inlineData }] : [];
+    }
+
+    return [];
+  });
+}
+
+function dataUrlToInlineData(url: string): { mimeType: string; data: string } | undefined {
+  const match = /^data:(.+?);base64,(.+)$/i.exec(url);
+  if (!match) {
+    return undefined;
+  }
+  return {
+    mimeType: match[1],
+    data: match[2],
+  };
+}
+
+function normalizeGoogleStreamEvent(data: unknown): unknown {
+  if (!isRecord(data)) {
+    return data;
+  }
+
+  const candidate = Array.isArray(data.candidates) && isRecord(data.candidates[0]) ? data.candidates[0] : undefined;
+  const parts = isRecord(candidate?.content) && Array.isArray(candidate.content.parts)
+    ? candidate.content.parts.filter(isRecord)
+    : [];
+  const text = parts
+    .filter((part) => typeof part.text === "string" && part.thought !== true)
+    .map((part) => part.text as string)
+    .join("");
+  const reasoning = parts
+    .filter((part) => typeof part.text === "string" && part.thought === true)
+    .map((part) => part.text as string)
+    .join("");
+  const toolCalls = parts.flatMap((part, index) => {
+    if (!isRecord(part.functionCall) || typeof part.functionCall.name !== "string") {
+      return [];
+    }
+
+    return [{
+      index,
+      id: "",
+      type: "function",
+      function: {
+        name: part.functionCall.name,
+        arguments: JSON.stringify(part.functionCall.args ?? {}),
+      },
+    }];
+  });
+  const usage = normalizeGoogleUsage(data.usageMetadata);
+
+  if (!text && !reasoning && !toolCalls.length && !candidate?.finishReason && !usage) {
+    return { choices: [] };
+  }
+
+  return {
+    choices: [{
+      index: 0,
+      delta: {
+        ...(text ? { content: text } : {}),
+        ...(reasoning ? { reasoning_content: reasoning } : {}),
+        ...(toolCalls.length ? { tool_calls: toolCalls } : {}),
+      },
+      finish_reason: normalizeGoogleFinishReason(
+        typeof candidate?.finishReason === "string" ? candidate.finishReason : undefined,
+        toolCalls.length > 0,
+      ),
+    }],
+    ...(usage ? { usage } : {}),
+  };
+}
+
+function normalizeGoogleFullResponse(data: unknown): unknown {
+  if (!isRecord(data) || Array.isArray(data.choices)) {
+    return data;
+  }
+
+  const candidate = Array.isArray(data.candidates) && isRecord(data.candidates[0]) ? data.candidates[0] : undefined;
+  const parts = isRecord(candidate?.content) && Array.isArray(candidate.content.parts)
+    ? candidate.content.parts.filter(isRecord)
+    : [];
+  const text = parts
+    .filter((part) => typeof part.text === "string" && part.thought !== true)
+    .map((part) => part.text as string)
+    .join("");
+  const reasoning = parts
+    .filter((part) => typeof part.text === "string" && part.thought === true)
+    .map((part) => part.text as string)
+    .join("");
+  const toolCalls = parts.flatMap((part) => {
+    if (!isRecord(part.functionCall) || typeof part.functionCall.name !== "string") {
+      return [];
+    }
+
+    return [{
+      id: "",
+      type: "function",
+      function: {
+        name: part.functionCall.name,
+        arguments: JSON.stringify(part.functionCall.args ?? {}),
+      },
+    }];
+  });
+  const usage = normalizeGoogleUsage(data.usageMetadata);
+
+  return {
+    choices: [{
+      index: 0,
+      message: {
+        ...(text ? { content: text } : {}),
+        ...(reasoning ? { reasoning_content: reasoning } : {}),
+        ...(toolCalls.length ? { tool_calls: toolCalls } : {}),
+      },
+      finish_reason: normalizeGoogleFinishReason(
+        typeof candidate?.finishReason === "string" ? candidate.finishReason : undefined,
+        toolCalls.length > 0,
+      ),
+    }],
+    ...(usage ? { usage } : {}),
+  };
+}
+
+function normalizeGoogleUsage(usage: unknown): Record<string, unknown> | undefined {
+  if (!isRecord(usage)) {
+    return undefined;
+  }
+
+  const promptTokens = typeof usage.promptTokenCount === "number" ? usage.promptTokenCount : undefined;
+  const candidatesTokens = typeof usage.candidatesTokenCount === "number" ? usage.candidatesTokenCount : undefined;
+  const thoughtsTokens = typeof usage.thoughtsTokenCount === "number" ? usage.thoughtsTokenCount : undefined;
+  const cachedTokens = typeof usage.cachedContentTokenCount === "number" ? usage.cachedContentTokenCount : undefined;
+  const completionTokens = candidatesTokens !== undefined ? candidatesTokens + (thoughtsTokens ?? 0) : undefined;
+
+  if (promptTokens === undefined && completionTokens === undefined) {
+    return undefined;
+  }
+
+  return {
+    prompt_tokens: promptTokens,
+    completion_tokens: completionTokens,
+    total_tokens: typeof usage.totalTokenCount === "number"
+      ? usage.totalTokenCount
+      : promptTokens !== undefined && completionTokens !== undefined
+        ? promptTokens + completionTokens
+        : undefined,
+    ...(cachedTokens !== undefined ? { prompt_tokens_details: { cached_tokens: cachedTokens } } : {}),
+  };
+}
+
+function normalizeGoogleFinishReason(
+  finishReason: string | undefined,
+  hasToolCalls: boolean,
+): "stop" | "tool_calls" | "length" | "content_filter" | null {
+  if (!finishReason) {
+    return null;
+  }
+  if (finishReason === "STOP") {
+    return hasToolCalls ? "tool_calls" : "stop";
+  }
+  if (finishReason === "MAX_TOKENS") {
+    return "length";
+  }
+  if (["IMAGE_SAFETY", "RECITATION", "SAFETY", "BLOCKLIST", "PROHIBITED_CONTENT", "SPII"].includes(finishReason)) {
+    return "content_filter";
+  }
+  return null;
+}
+
 // The official OpenCode client sends these headers on every request. The Zen
 // gateway reads x-opencode-session first, then converts that sticky identifier
 // into provider-specific affinity headers such as x-session-affinity upstream.
@@ -1363,6 +2047,7 @@ async function streamOpenCodeResponse(
   verbose: boolean = false,
   requestTimeoutMs = DEFAULT_REQUEST_TIMEOUT_MS,
   streamIdleTimeoutMs = DEFAULT_STREAM_IDLE_TIMEOUT_MS,
+  authHeaders: Record<string, string> = { Authorization: `Bearer ${apiKey}` },
 ): Promise<void> {
   const controller = new AbortController();
   let abortReason:
@@ -1396,7 +2081,7 @@ async function streamOpenCodeResponse(
     const response = await fetch(url, {
       method: "POST",
       headers: {
-        "Authorization": `Bearer ${apiKey}`,
+        ...authHeaders,
         "Content-Type": "application/json",
         ...requestHeaders,
       },
@@ -2598,12 +3283,36 @@ function modelCapabilities(metadata: ResolvedModelMetadata): CopilotCompatibleCa
   };
 }
 
-function modelEndpointKind(modelId: string, provider: ProviderDefinition): OpenCodeModel["endpointKind"] {
-  if (provider.vendor === GO_VENDOR && modelId.startsWith("minimax-m2.")) {
-    return "messages";
+function resolveModelRouting(modelId: string, provider: ProviderDefinition): ModelRoutingFields {
+  if (provider.vendor === ZEN_VENDOR && /^gpt-/i.test(modelId)) {
+    return {
+      endpointKind: "responses",
+      endpointUrl: provider.responsesUrl ?? provider.chatCompletionsUrl,
+      sdkPackage: "@ai-sdk/openai",
+    };
   }
 
-  return "chat-completions";
+  if (/^claude-/i.test(modelId) || (provider.vendor === GO_VENDOR && /^minimax-m2\./i.test(modelId))) {
+    return {
+      endpointKind: "messages",
+      endpointUrl: provider.messagesUrl,
+      sdkPackage: "@ai-sdk/anthropic",
+    };
+  }
+
+  if (provider.vendor === ZEN_VENDOR && /^gemini-/i.test(modelId)) {
+    return {
+      endpointKind: "google",
+      endpointUrl: `${provider.modelsUrl}/${modelId}`,
+      sdkPackage: "@ai-sdk/google",
+    };
+  }
+
+  return {
+    endpointKind: "chat-completions",
+    endpointUrl: provider.chatCompletionsUrl,
+    sdkPackage: "@ai-sdk/openai-compatible",
+  };
 }
 
 function toEffectiveModelId(modelId: string, vendor: ProviderDefinition["vendor"]): string {
