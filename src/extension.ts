@@ -1,7 +1,35 @@
 import * as vscode from "vscode";
+import {
+  buildOpenCodeRequestError,
+  formatDuration,
+  formatRateLimitSummary,
+  OpenCodeRequestError,
+  readRateLimitInfo,
+  truncateForLog,
+} from "./errors";
+import {
+  MODEL_METADATA_CACHE_KEY,
+  MODEL_METADATA_REVISION,
+  MODELS_DEV_API_URL,
+  bundledModelMetadataSnapshot,
+  fallbackModelMetadata,
+  hasExplicitModelLimits,
+  isFreshModelMetadata,
+  normalizeLiveModelMetadata,
+  normalizeModelsDevSnapshot,
+  resolveModelMetadata,
+  toEffectiveModelId,
+  type ModelsDevResponse,
+} from "./metadata";
+import {
+  normalizeGoogleFullResponse,
+  normalizeGoogleStreamEvent,
+  normalizeResponsesFullResponse,
+  normalizeResponsesStreamEvent,
+  resolveModelRouting,
+} from "./routing";
+import { GO_VENDOR, ZEN_VENDOR } from "./providerTypes";
 
-const GO_VENDOR = "opencodego";
-const ZEN_VENDOR = "opencodezen";
 const SECRET_KEY = "opencodego.apiKey";
 
 interface ProviderDefinition {
@@ -11,21 +39,29 @@ interface ProviderDefinition {
   modelsUrl: string;
   chatCompletionsUrl: string;
   messagesUrl: string;
+  responsesUrl?: string;
   categoryOrder: number;
   testModelId: string;
   fallbackModels: string[];
   filterModel?: (modelId: string) => boolean;
 }
 
+type ModelEndpointKind =
+  | "chat-completions"
+  | "messages"
+  | "responses"
+  | "google";
+
 const FREE_ZEN_MODEL_IDS = new Set(["big-pickle"]);
-const MODELS_DEV_API_URL = "https://models.dev/api.json";
 const KNOWN_UNAVAILABLE_MODEL_IDS = new Set([
   "ring-2.6-1t",
   "ring-2.6-1t-free",
   "trinity-large-preview-free"
 ]);
-// Bump this when we need to force VS Code picker metadata refresh.
-const MODEL_METADATA_REVISION = "naming-2026-05-17-a";
+const DEFAULT_REQUEST_TIMEOUT_MS = 10 * 60 * 1000;
+const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 2 * 60 * 1000;
+const OPEN_CODE_CLIENT = "vscode-copilot-chat";
+const OPEN_CODE_USER_AGENT = "opencode-copilot-chat/0.1.6 VSCode";
 
 const PROVIDERS: Record<ProviderDefinition["vendor"], ProviderDefinition> = {
   [GO_VENDOR]: {
@@ -63,6 +99,7 @@ const PROVIDERS: Record<ProviderDefinition["vendor"], ProviderDefinition> = {
     modelsUrl: "https://opencode.ai/zen/v1/models",
     chatCompletionsUrl: "https://opencode.ai/zen/v1/chat/completions",
     messagesUrl: "https://opencode.ai/zen/v1/messages",
+    responsesUrl: "https://opencode.ai/zen/v1/responses",
     categoryOrder: 3,
     testModelId: "deepseek-v4-flash-free",
     fallbackModels: [
@@ -79,7 +116,7 @@ const PROVIDERS: Record<ProviderDefinition["vendor"], ProviderDefinition> = {
 type ApiRole = "user" | "assistant" | "tool";
 
 interface OpenCodeModel extends vscode.LanguageModelChatInformation {
-  endpointKind: "chat-completions" | "messages";
+  endpointKind: ModelEndpointKind;
   provider: ProviderDefinition;
   rawModelId?: string;
   category?: {
@@ -90,19 +127,31 @@ interface OpenCodeModel extends vscode.LanguageModelChatInformation {
   configurationSchema?: vscode.LanguageModelConfigurationSchema;
 }
 
-interface ModelListResponse {
-  data?: Array<{
-    id?: string;
-    owned_by?: string;
-  }>;
+interface ModelListEntry {
+  id?: string;
+  owned_by?: string;
+  status?: string;
+  deprecated?: boolean;
+  limit?: {
+    context?: number;
+    output?: number;
+  };
+  context_window?: number;
+  contextWindow?: number;
+  max_output_tokens?: number;
+  maxOutputTokens?: number;
+  attachment?: boolean;
+  image_input?: boolean;
+  imageInput?: boolean;
+  reasoning?: boolean;
+  modalities?: {
+    input?: string[];
+    output?: string[];
+  };
 }
 
-interface ModelsDevResponse {
-  opencode?: {
-    models?: Record<string, {
-      status?: string;
-    }>;
-  };
+interface ModelListResponse {
+  data?: ModelListEntry[];
 }
 
 interface ApiMessage {
@@ -149,6 +198,8 @@ interface ApiSettings {
   maxOutputTokensOverride: number;
   maxInputTokensOverride: number;
   debugReasoning: boolean;
+  requestTimeoutMs: number;
+  streamIdleTimeoutMs: number;
   thinking: ThinkingSettings;
 }
 
@@ -175,48 +226,38 @@ interface ModelLimits extends BaseModelLimits {
   advertisedMaxOutputTokens: number;
 }
 
+interface ModelMetadataFields {
+  contextWindow?: number;
+  maxOutputTokens?: number;
+  supportsVision?: boolean;
+  reasoning?: boolean;
+  status?: string;
+}
+
+interface CachedModelMetadataSnapshot {
+  fetchedAt: number;
+  providers: Record<
+    ProviderDefinition["vendor"],
+    Record<string, ModelMetadataFields>
+  >;
+}
+
+interface ResolvedModelMetadata extends BaseModelLimits {
+  supportsVision: boolean;
+  reasoning: boolean;
+  status?: string;
+  source: "models.dev" | "live" | "fallback" | "default";
+}
+
+interface ModelRoutingFields {
+  endpointKind: ModelEndpointKind;
+  endpointUrl: string;
+  sdkPackage?: string;
+}
+
 // Copilot surfaces combine input/output metadata differently across views.
 // Reserve a modest UI output budget, while requests still use the real model max.
 const UI_OUTPUT_TOKEN_RESERVE = 8192;
-
-const DEFAULT_MODEL_LIMITS: BaseModelLimits = {
-  contextWindow: 262144,
-  maxOutputTokens: 65536
-};
-
-// Context limits sourced from models.dev (official OpenCode model registry).
-// Keep limits per provider to avoid cross-provider contamination in VS Code's
-// picker metadata cache.
-const MODEL_LIMITS_BY_PROVIDER: Record<ProviderDefinition["vendor"], Record<string, BaseModelLimits>> = {
-  [GO_VENDOR]: {
-    "deepseek-v4-flash": { contextWindow: 1000000, maxOutputTokens: 384000 },
-    "deepseek-v4-pro": { contextWindow: 1000000, maxOutputTokens: 384000 },
-    "mimo-v2.5": { contextWindow: 1000000, maxOutputTokens: 128000 },
-    "mimo-v2.5-pro": { contextWindow: 1048576, maxOutputTokens: 128000 },
-    "mimo-v2-omni": { contextWindow: 262144, maxOutputTokens: 128000 },
-    "mimo-v2-pro": { contextWindow: 1048576, maxOutputTokens: 128000 },
-    "kimi-k2.6": { contextWindow: 262144, maxOutputTokens: 65536 },
-    "kimi-k2.5": { contextWindow: 262144, maxOutputTokens: 65536 },
-    "glm-5.1": { contextWindow: 204800, maxOutputTokens: 131072 },
-    "glm-5": { contextWindow: 204800, maxOutputTokens: 131072 },
-    "minimax-m2.7": { contextWindow: 204800, maxOutputTokens: 131072 },
-    "minimax-m2.5": { contextWindow: 204800, maxOutputTokens: 131072 },
-    "qwen3.6-plus": { contextWindow: 262144, maxOutputTokens: 65536 },
-    "qwen3.5-plus": { contextWindow: 262144, maxOutputTokens: 65536 },
-    "hy3-preview": { contextWindow: 256000, maxOutputTokens: 64000 },
-    "ring-2.6-1t": { contextWindow: 262000, maxOutputTokens: 66000 }
-  },
-  [ZEN_VENDOR]: {
-    "deepseek-v4-flash-free": { contextWindow: 1000000, maxOutputTokens: 384000 },
-    "minimax-m2.5-free": { contextWindow: 204800, maxOutputTokens: 131072 },
-    "qwen3.6-plus": { contextWindow: 262144, maxOutputTokens: 65536 },
-    "qwen3.6-plus-free": { contextWindow: 262144, maxOutputTokens: 65536 },
-    "qwen3.5-plus": { contextWindow: 262144, maxOutputTokens: 65536 },
-    "trinity-large-preview-free": { contextWindow: 131072, maxOutputTokens: 131072 },
-    "nemotron-3-super-free": { contextWindow: 204800, maxOutputTokens: 128000 },
-    "big-pickle": { contextWindow: 200000, maxOutputTokens: 128000 }
-  }
-};
 
 type CopilotCompatibleCapabilities = vscode.LanguageModelChatCapabilities & {
   supportsToolCalling: boolean;
@@ -230,27 +271,11 @@ type CopilotCompatibleCapabilities = vscode.LanguageModelChatCapabilities & {
 // catalogs can still hit 5xx during traffic bursts. Surface this so users know
 // to retry or fall back to another free model if the request fails.
 const CAPACITY_LIMITED_MODEL_NOTES: Record<string, string> = {
-  "qwen3.6-plus-free": "Free relaunch with limited GPU capacity. Stable for short prompts; bursty traffic or very large tool catalogs may return 5xx — retry or fall back to 'deepseek-v4-flash-free' / 'minimax-m2.5-free'. Paid 'qwen3.6-plus' has no quota."
+  "qwen3.6-plus-free": "Free relaunch with limited GPU capacity. Stable for short prompts; bursty traffic or very large tool catalogs may return 5xx - retry or fall back to 'deepseek-v4-flash-free' / 'big-pickle'. Paid 'qwen3.6-plus' has no quota."
 };
 
-let deprecatedOpenCodeModelIdsPromise: Promise<Set<string>> | undefined;
-
-const VISION_CAPABLE_MODELS = new Set([
-  "minimax-m2.7",
-  "minimax-m2.5",
-  "minimax-m2.5-free",
-  "kimi-k2.6",
-  "kimi-k2.5",
-  "glm-5.1",
-  "glm-5",
-  "mimo-v2.5",
-  "mimo-v2.5-pro",
-  "mimo-v2-omni",
-  "mimo-v2-pro",
-  "qwen3.6-plus",
-  "qwen3.6-plus-free",
-  "qwen3.5-plus"
-]);
+let modelMetadataSnapshot: CachedModelMetadataSnapshot | undefined;
+let modelMetadataRefreshPromise: Promise<CachedModelMetadataSnapshot> | undefined;
 
 interface OpenAiToolDefinition {
   type: "function";
@@ -358,6 +383,7 @@ class OpenCodeProvider implements vscode.LanguageModelChatProvider<OpenCodeModel
   readonly onDidChangeLanguageModelChatInformation = this.changeEmitter.event;
   private readonly apiKeysByModelId = new Map<string, string>();
   private readonly reasoningContentByToolCallId = new Map<string, string>();
+  private readonly liveModelMetadataById = new Map<string, ModelMetadataFields>();
   private outputChannel: vscode.OutputChannel | undefined;
 
   constructor(
@@ -375,6 +401,40 @@ class OpenCodeProvider implements vscode.LanguageModelChatProvider<OpenCodeModel
 
   private log(message: string): void {
     this.getOutputChannel().appendLine(`[${new Date().toISOString()}] ${message}`);
+  }
+
+  private async getMetadataSnapshot(): Promise<CachedModelMetadataSnapshot> {
+    return getOpenCodeModelMetadata(this.context, this.getOutputChannel());
+  }
+
+  private resolveModelMetadata(
+    modelId: string,
+    snapshot: CachedModelMetadataSnapshot,
+  ): ResolvedModelMetadata {
+    return resolveModelMetadata(
+      modelId,
+      this.definition.vendor,
+      snapshot,
+      this.liveModelMetadataById,
+    );
+  }
+
+  private replaceLiveModelMetadata(entries: ModelListEntry[] | undefined): void {
+    this.liveModelMetadataById.clear();
+    for (const entry of entries ?? []) {
+      if (typeof entry.id !== "string" || !entry.id) {
+        continue;
+      }
+      const metadata = normalizeLiveModelMetadata(entry);
+      if (metadata) {
+        this.liveModelMetadataById.set(entry.id, metadata);
+      }
+    }
+  }
+
+  private async refreshMetadataAndModels(): Promise<void> {
+    await clearOpenCodeModelMetadataCache(this.context);
+    await this.fetchModels();
   }
 
   async manage(): Promise<void> {
@@ -419,6 +479,7 @@ class OpenCodeProvider implements vscode.LanguageModelChatProvider<OpenCodeModel
       return;
     }
 
+    await this.refreshMetadataAndModels();
     this.changeEmitter.fire();
     vscode.window.showInformationMessage(`${this.definition.displayName} models refreshed.`);
   }
@@ -486,9 +547,11 @@ class OpenCodeProvider implements vscode.LanguageModelChatProvider<OpenCodeModel
 
   async showDiagnostics(): Promise<void> {
     const models = await vscode.lm.selectChatModels({ vendor: this.definition.vendor });
+    const metadataSnapshot = await this.getMetadataSnapshot();
     const lines = models.map((model) => {
       const rawModelId = resolveRawModelId(model.id);
-      const limits = modelLimits(rawModelId, undefined, this.definition.vendor);
+      const metadata = this.resolveModelMetadata(rawModelId, metadataSnapshot);
+      const limits = modelLimits(metadata);
       return [
       `- ${rawModelId}`,
       `  rawModelId: ${rawModelId}`,
@@ -500,9 +563,12 @@ class OpenCodeProvider implements vscode.LanguageModelChatProvider<OpenCodeModel
       `  advertisedMaxOutputTokens: ${limits.advertisedMaxOutputTokens}`,
       `  advertisedContextWindow: ${limits.advertisedContextWindow}`,
       `  apiMaxOutputTokens: ${limits.maxOutputTokens}`,
+      `  metadataSource: ${metadata.source}`,
+      `  supportsVision: ${metadata.supportsVision}`,
+      `  status: ${metadata.status ?? "active"}`,
       `  thinkingFamily: ${thinkingFamily(rawModelId) ?? "none"}`,
       `  configurationSchema: ${JSON.stringify((model as unknown as { configurationSchema?: unknown }).configurationSchema ?? null)}`,
-      ...(hasExplicitModelLimits(rawModelId, this.definition.vendor) ? [] : ["  limits: using default fallback"])
+      ...(hasExplicitModelLimits(rawModelId, this.definition.vendor) ? [] : ["  limits: using bundled fallback"])
       ].join("\n");
     });
 
@@ -534,10 +600,13 @@ class OpenCodeProvider implements vscode.LanguageModelChatProvider<OpenCodeModel
 
     const models = await this.fetchModels();
     const settings = getSettings();
+    const metadataSnapshot = await this.getMetadataSnapshot();
 
     return models.map((modelId) => {
+      const metadata = this.resolveModelMetadata(modelId, metadataSnapshot);
+      const routing = resolveModelRouting(modelId, this.definition);
       const effectiveModelId = toEffectiveModelId(modelId, this.definition.vendor);
-      const limits = modelLimits(modelId, settings, this.definition.vendor);
+      const limits = modelLimits(metadata, settings);
       this.apiKeysByModelId.set(modelId, apiKey);
       this.apiKeysByModelId.set(effectiveModelId, apiKey);
 
@@ -563,15 +632,15 @@ class OpenCodeProvider implements vscode.LanguageModelChatProvider<OpenCodeModel
         isUserSelectable: true,
         maxInputTokens: limits.advertisedMaxInputTokens,
         maxOutputTokens: limits.advertisedMaxOutputTokens,
-        capabilities: modelCapabilities(modelId),
-        endpointKind: modelEndpointKind(modelId, this.definition),
+        capabilities: modelCapabilities(metadata),
+        endpointKind: routing.endpointKind,
         provider: this.definition,
         // Inline so Copilot Chat picks up the Thinking submenu directly
         // (parity with zelosleone/Opencode-Go-For-Copilot pattern).
         ...(configurationSchema ? { configurationSchema } : {})
       };
 
-      this.log(`Model registered: id=${info.id} family=${info.family} configurationSchema=${configurationSchema ? JSON.stringify(configurationSchema) : "none"}`);
+      this.log(`Model registered: id=${info.id} family=${info.family} metadataSource=${metadata.source} endpointKind=${routing.endpointKind} endpointUrl=${routing.endpointUrl} configurationSchema=${configurationSchema ? JSON.stringify(configurationSchema) : "none"}`);
 
       return info;
     });
@@ -603,23 +672,50 @@ class OpenCodeProvider implements vscode.LanguageModelChatProvider<OpenCodeModel
       ...baseSettings,
       thinking: applyRequestThinkingOverride(rawModelId, baseSettings.thinking, requestOverride)
     };
-    const limits = modelLimits(rawModelId, settings, model.provider.vendor);
+    const metadataSnapshot = await this.getMetadataSnapshot();
+    const metadata = this.resolveModelMetadata(rawModelId, metadataSnapshot);
+    const routing = resolveModelRouting(rawModelId, this.definition);
+    const limits = modelLimits(metadata, settings);
     const thinkingPayload = buildThinkingPayload(rawModelId, settings.thinking);
+    const requestHeaders = buildOpenCodeRequestHeaders(
+      messages,
+      options,
+      rawModelId,
+    );
 
-    this.log(`Request: model=${model.id} rawModel=${rawModelId} endpoint=${model.endpointKind} messages=${apiMessages.length} modelConfiguration=${JSON.stringify(pickThinkingModelConfiguration(requestOverride))} thinking=${JSON.stringify(settings.thinking)} thinkingPayload=${JSON.stringify(thinkingPayload)}`);
+    this.log(`Request: model=${model.id} rawModel=${rawModelId} endpoint=${routing.endpointKind} metadataSource=${metadata.source} messages=${apiMessages.length} session=${requestHeaders["x-opencode-session"]} request=${requestHeaders["x-opencode-request"]} modelConfiguration=${JSON.stringify(pickThinkingModelConfiguration(requestOverride))} thinking=${JSON.stringify(settings.thinking)} thinkingPayload=${JSON.stringify(thinkingPayload)}`);
     if (settings.debugReasoning) {
       this.log("Reasoning debug is enabled. Provider reasoning_content will be written to this output channel when available.");
     }
 
     try {
-      if (model.endpointKind === "messages") {
-        await streamAnthropicMessages(this.definition.messagesUrl, this.definition.displayName, apiKey, rawModelId, apiMessages, options, settings, limits, progress, token, this.getOutputChannel());
+      if (routing.endpointKind === "messages") {
+        await streamAnthropicMessages(routing.endpointUrl, this.definition.displayName, apiKey, rawModelId, apiMessages, options, settings, limits, requestHeaders, progress, token, this.getOutputChannel());
+        return;
+      }
+
+      if (routing.endpointKind === "responses") {
+        await streamResponsesApi(routing.endpointUrl, this.definition.displayName, apiKey, rawModelId, apiMessages, options, settings, limits, requestHeaders, progress, token, this.getOutputChannel(), (toolCallIds, reasoningContent) => {
+          for (const toolCallId of toolCallIds) {
+            this.reasoningContentByToolCallId.set(toolCallId, reasoningContent);
+          }
+        });
+        this.log(`Request completed: model=${model.id}`);
+        return;
+      }
+
+      if (routing.endpointKind === "google") {
+        await streamGoogleGenerateContent(routing.endpointUrl, this.definition.displayName, apiKey, rawModelId, apiMessages, options, settings, limits, requestHeaders, progress, token, this.getOutputChannel(), (toolCallIds, reasoningContent) => {
+          for (const toolCallId of toolCallIds) {
+            this.reasoningContentByToolCallId.set(toolCallId, reasoningContent);
+          }
+        });
         return;
       }
 
       if (isQwenModel(rawModelId)) {
         await streamChatCompletionsWithAnthropicStream(
-          this.definition.chatCompletionsUrl,
+          routing.endpointUrl,
           this.definition.displayName,
           apiKey,
           rawModelId,
@@ -627,6 +723,7 @@ class OpenCodeProvider implements vscode.LanguageModelChatProvider<OpenCodeModel
           options,
           settings,
           limits,
+          requestHeaders,
           progress,
           token,
           this.getOutputChannel()
@@ -636,7 +733,7 @@ class OpenCodeProvider implements vscode.LanguageModelChatProvider<OpenCodeModel
       }
 
       await streamChatCompletions(
-        this.definition.chatCompletionsUrl,
+        routing.endpointUrl,
         this.definition.displayName,
         apiKey,
         rawModelId,
@@ -644,6 +741,7 @@ class OpenCodeProvider implements vscode.LanguageModelChatProvider<OpenCodeModel
         options,
         settings,
         limits,
+        requestHeaders,
         progress,
         token,
         this.getOutputChannel(),
@@ -658,6 +756,9 @@ class OpenCodeProvider implements vscode.LanguageModelChatProvider<OpenCodeModel
       const message = error instanceof Error ? error.message : String(error);
       this.log(`ERROR model=${model.id}: ${message}`);
       this.getOutputChannel().show(true);
+      if (error instanceof OpenCodeRequestError) {
+        vscode.window.showErrorMessage(error.userMessage);
+      }
       throw error;
     }
   }
@@ -680,6 +781,7 @@ class OpenCodeProvider implements vscode.LanguageModelChatProvider<OpenCodeModel
       }
 
       const data = await response.json() as ModelListResponse;
+      this.replaceLiveModelMetadata(data.data);
       const ids = data.data
         ?.map((model) => model.id)
         .filter((id): id is string => typeof id === "string" && id.length > 0)
@@ -697,10 +799,10 @@ class OpenCodeProvider implements vscode.LanguageModelChatProvider<OpenCodeModel
     const uniqueModelIds = [...new Set(modelIds)];
 
     try {
-      const deprecatedModelIds = await fetchDeprecatedOpenCodeModelIds();
+      const metadataSnapshot = await this.getMetadataSnapshot();
       const filteredModelIds = uniqueModelIds.filter((modelId) =>
         !KNOWN_UNAVAILABLE_MODEL_IDS.has(modelId)
-        && !deprecatedModelIds.has(modelId)
+        && !shouldHideDeprecatedModel(modelId, this.definition.vendor, metadataSnapshot)
       );
 
       const removedModelIds = uniqueModelIds.filter((modelId) => !filteredModelIds.includes(modelId));
@@ -723,28 +825,89 @@ function getConfiguredApiKey(options?: { configuration?: LanguageModelConfigurat
   return typeof configuredApiKey === "string" && configuredApiKey.trim() ? configuredApiKey.trim() : undefined;
 }
 
-async function fetchDeprecatedOpenCodeModelIds(): Promise<Set<string>> {
-  deprecatedOpenCodeModelIdsPromise ??= (async () => {
-    const response = await fetch(MODELS_DEV_API_URL);
+async function clearOpenCodeModelMetadataCache(
+  context: vscode.ExtensionContext,
+): Promise<void> {
+  modelMetadataSnapshot = undefined;
+  modelMetadataRefreshPromise = undefined;
+  await context.globalState.update(MODEL_METADATA_CACHE_KEY, undefined);
+}
+
+async function getOpenCodeModelMetadata(
+  context: vscode.ExtensionContext,
+  output?: vscode.OutputChannel,
+): Promise<CachedModelMetadataSnapshot> {
+  const cached =
+    modelMetadataSnapshot ??
+    context.globalState.get<CachedModelMetadataSnapshot>(
+      MODEL_METADATA_CACHE_KEY,
+    );
+  if (cached) {
+    modelMetadataSnapshot = cached;
+    if (isFreshModelMetadata(cached)) {
+      return cached;
+    }
+    void refreshOpenCodeModelMetadata(context, output);
+    return cached;
+  }
+
+  return refreshOpenCodeModelMetadata(context, output);
+}
+
+async function refreshOpenCodeModelMetadata(
+  context: vscode.ExtensionContext,
+  output?: vscode.OutputChannel,
+): Promise<CachedModelMetadataSnapshot> {
+  if (modelMetadataRefreshPromise) {
+    return modelMetadataRefreshPromise;
+  }
+
+  modelMetadataRefreshPromise = (async () => {
+    const response = await fetch(MODELS_DEV_API_URL, {
+      signal: AbortSignal.timeout(10_000)
+    });
 
     if (!response.ok) {
       throw new Error(`models.dev request failed (${response.status}): ${response.statusText}`);
     }
 
     const data = await response.json() as ModelsDevResponse;
-    const models = data.opencode?.models ?? {};
-    const deprecatedModelIds = new Set<string>();
-
-    for (const [modelId, model] of Object.entries(models)) {
-      if (model.status === "deprecated") {
-        deprecatedModelIds.add(modelId);
+    const snapshot = normalizeModelsDevSnapshot(data);
+    modelMetadataSnapshot = snapshot;
+    await context.globalState.update(MODEL_METADATA_CACHE_KEY, snapshot);
+    output?.appendLine(
+      `[metadata] refreshed models.dev cache go=${Object.keys(snapshot.providers[GO_VENDOR]).length} zen=${Object.keys(snapshot.providers[ZEN_VENDOR]).length}`,
+    );
+    return snapshot;
+  })()
+    .catch((error) => {
+      const cached =
+        modelMetadataSnapshot ??
+        context.globalState.get<CachedModelMetadataSnapshot>(
+          MODEL_METADATA_CACHE_KEY,
+        );
+      if (cached) {
+        const message = error instanceof Error ? error.message : String(error);
+        output?.appendLine(
+          `[metadata] refresh failed, using cached snapshot: ${message}`,
+        );
+        modelMetadataSnapshot = cached;
+        return cached;
       }
-    }
 
-    return deprecatedModelIds;
-  })();
+      const message = error instanceof Error ? error.message : String(error);
+      const fallback = bundledModelMetadataSnapshot();
+      output?.appendLine(
+        `[metadata] refresh failed, using bundled snapshot: ${message}`,
+      );
+      modelMetadataSnapshot = fallback;
+      return fallback;
+    })
+    .finally(() => {
+      modelMetadataRefreshPromise = undefined;
+    });
 
-  return deprecatedOpenCodeModelIdsPromise;
+  return modelMetadataRefreshPromise;
 }
 
 async function streamChatCompletions(
@@ -756,6 +919,7 @@ async function streamChatCompletions(
   options: vscode.ProvideLanguageModelChatResponseOptions,
   settings: ApiSettings,
   limits: ModelLimits,
+  requestHeaders: Record<string, string>,
   progress: vscode.Progress<vscode.LanguageModelResponsePart>,
   token: vscode.CancellationToken,
   output: vscode.OutputChannel,
@@ -788,12 +952,15 @@ async function streamChatCompletions(
       ...thinkingPayload,
       ...(tools.length ? { tools, tool_choice: toolChoice(options.toolMode) } : {})
     },
+    requestHeaders,
     progress,
     token,
     (data) => extractor.extractStreamParts(data),
     extractChatCompletionParts,
     output,
-    settings.debugReasoning
+    settings.debugReasoning,
+    settings.requestTimeoutMs,
+    settings.streamIdleTimeoutMs,
   );
 
   extractor.flushReasoningFallback(progress);
@@ -813,6 +980,7 @@ async function streamChatCompletionsWithAnthropicStream(
   options: vscode.ProvideLanguageModelChatResponseOptions,
   settings: ApiSettings,
   limits: ModelLimits,
+  requestHeaders: Record<string, string>,
   progress: vscode.Progress<vscode.LanguageModelResponsePart>,
   token: vscode.CancellationToken,
   output: vscode.OutputChannel
@@ -841,6 +1009,7 @@ async function streamChatCompletionsWithAnthropicStream(
       ...thinkingPayload,
       ...(tools.length ? { tools, tool_choice: toolChoice(options.toolMode) } : {})
     },
+    requestHeaders,
     progress,
     token,
     (data) => {
@@ -852,7 +1021,9 @@ async function streamChatCompletionsWithAnthropicStream(
       return openAiParts.length ? openAiParts : extractAnthropicParts(data);
     },
     output,
-    settings.debugReasoning
+    settings.debugReasoning,
+    settings.requestTimeoutMs,
+    settings.streamIdleTimeoutMs,
   );
 
   openAiExtractor.flushReasoningFallback(progress);
@@ -873,6 +1044,7 @@ async function streamAnthropicMessages(
   options: vscode.ProvideLanguageModelChatResponseOptions,
   settings: ApiSettings,
   limits: ModelLimits,
+  requestHeaders: Record<string, string>,
   progress: vscode.Progress<vscode.LanguageModelResponsePart>,
   token: vscode.CancellationToken,
   output?: vscode.OutputChannel
@@ -898,13 +1070,427 @@ async function streamAnthropicMessages(
       ...thinkingPayload,
       ...(tools.length ? { tools, tool_choice: anthropicToolChoice(options.toolMode) } : {})
     },
+    requestHeaders,
     progress,
     token,
     (data) => extractor.extractStreamParts(data),
     extractAnthropicParts,
     output,
-    settings.debugReasoning
+    settings.debugReasoning,
+    settings.requestTimeoutMs,
+    settings.streamIdleTimeoutMs,
+    {
+      Authorization: `Bearer ${apiKey}`,
+      "x-api-key": apiKey,
+      "anthropic-version": "2023-06-01"
+    },
   );
+}
+
+async function streamResponsesApi(
+  url: string,
+  providerDisplayName: string,
+  apiKey: string,
+  modelId: string,
+  messages: ApiMessage[],
+  options: vscode.ProvideLanguageModelChatResponseOptions,
+  settings: ApiSettings,
+  limits: ModelLimits,
+  requestHeaders: Record<string, string>,
+  progress: vscode.Progress<vscode.LanguageModelResponsePart>,
+  token: vscode.CancellationToken,
+  output: vscode.OutputChannel,
+  onReasoningContent?: (toolCallIds: string[], reasoningContent: string) => void,
+): Promise<void> {
+  const extractor = new OpenAiResponseExtractor(onReasoningContent, (reasoningContent) => {
+    if (settings.debugReasoning) {
+      output.appendLine("[reasoning_content]");
+      output.appendLine(reasoningContent);
+      output.appendLine("[/reasoning_content]");
+    }
+  });
+
+  await streamOpenCodeResponse(
+    url,
+    providerDisplayName,
+    apiKey,
+    buildResponsesRequestBody(modelId, messages, options, settings, limits),
+    requestHeaders,
+    progress,
+    token,
+    (data) => extractor.extractStreamParts(normalizeResponsesStreamEvent(data)),
+    (data) => extractChatCompletionParts(normalizeResponsesFullResponse(data)),
+    output,
+    settings.debugReasoning,
+    settings.requestTimeoutMs,
+    settings.streamIdleTimeoutMs,
+  );
+
+  extractor.flushReasoningFallback(progress);
+  output.appendLine(`[stream-summary model=${modelId}] textChars=${extractor.emittedText} toolCalls=${extractor.emittedTools} reasoningChars=${extractor.reasoningChars}`);
+}
+
+async function streamGoogleGenerateContent(
+  url: string,
+  providerDisplayName: string,
+  apiKey: string,
+  modelId: string,
+  messages: ApiMessage[],
+  options: vscode.ProvideLanguageModelChatResponseOptions,
+  settings: ApiSettings,
+  limits: ModelLimits,
+  requestHeaders: Record<string, string>,
+  progress: vscode.Progress<vscode.LanguageModelResponsePart>,
+  token: vscode.CancellationToken,
+  output: vscode.OutputChannel,
+  onReasoningContent?: (toolCallIds: string[], reasoningContent: string) => void,
+): Promise<void> {
+  const extractor = new OpenAiResponseExtractor(onReasoningContent, (reasoningContent) => {
+    if (settings.debugReasoning) {
+      output.appendLine("[reasoning_content]");
+      output.appendLine(reasoningContent);
+      output.appendLine("[/reasoning_content]");
+    }
+  });
+
+  await streamOpenCodeResponse(
+    `${url}:streamGenerateContent?alt=sse`,
+    providerDisplayName,
+    apiKey,
+    buildGoogleGenerateContentBody(messages, options, settings, limits),
+    requestHeaders,
+    progress,
+    token,
+    (data) => extractor.extractStreamParts(normalizeGoogleStreamEvent(data)),
+    (data) => extractChatCompletionParts(normalizeGoogleFullResponse(data)),
+    output,
+    settings.debugReasoning,
+    settings.requestTimeoutMs,
+    settings.streamIdleTimeoutMs,
+    {
+      Authorization: `Bearer ${apiKey}`,
+      "x-goog-api-key": apiKey
+    },
+  );
+
+  extractor.flushReasoningFallback(progress);
+  output.appendLine(`[stream-summary model=${modelId}] textChars=${extractor.emittedText} toolCalls=${extractor.emittedTools} reasoningChars=${extractor.reasoningChars}`);
+}
+
+function mapResponsesTools(tools: readonly vscode.LanguageModelChatTool[] | undefined): Array<Record<string, unknown>> {
+  return (tools ?? []).map((tool) => ({
+    type: "function",
+    name: tool.name,
+    description: tool.description,
+    parameters: sanitizeToolSchema(tool.inputSchema),
+  }));
+}
+
+function buildResponsesRequestBody(
+  modelId: string,
+  messages: ApiMessage[],
+  options: vscode.ProvideLanguageModelChatResponseOptions,
+  settings: ApiSettings,
+  limits: ModelLimits,
+): Record<string, unknown> {
+  const input = messages.flatMap((message) => responsesInputItemsFromMessage(message));
+  const tools = mapResponsesTools(options.tools);
+
+  return {
+    model: modelId,
+    input,
+    max_output_tokens: limits.maxOutputTokens,
+    temperature: settings.temperature,
+    stream: true,
+    ...(tools.length ? { tools, tool_choice: toolChoice(options.toolMode) } : {}),
+    text: { verbosity: modelId === "gpt-5-codex" ? "medium" : "low" },
+  };
+}
+
+function responsesInputItemsFromMessage(message: ApiMessage): Array<Record<string, unknown>> {
+  if (message.role === "user") {
+    const content = responsesUserContent(message.content);
+    return content.length ? [{ role: "user", content }] : [];
+  }
+
+  if (message.role === "assistant") {
+    const items: Array<Record<string, unknown>> = [];
+    const text = responsesAssistantText(message.content);
+    if (text) {
+      items.push({ role: "assistant", content: [{ type: "output_text", text }] });
+    }
+
+    for (const toolCall of message.tool_calls ?? []) {
+      items.push({
+        type: "function_call",
+        id: toolCall.id,
+        call_id: toolCall.id,
+        name: toolCall.function.name,
+        arguments: toolCall.function.arguments,
+      });
+    }
+
+    return items;
+  }
+
+  if (message.role === "tool" && message.tool_call_id) {
+    return [{
+      type: "function_call_output",
+      call_id: message.tool_call_id,
+      output: typeof message.content === "string" ? message.content : JSON.stringify(message.content ?? ""),
+    }];
+  }
+
+  return [];
+}
+
+function responsesUserContent(content: ApiMessage["content"]): Array<Record<string, unknown>> {
+  if (typeof content === "string") {
+    return content ? [{ type: "input_text", text: content }] : [];
+  }
+
+  if (!Array.isArray(content)) {
+    return [];
+  }
+
+  return content.flatMap((part): Array<Record<string, unknown>> => {
+    if (part.type === "text" && typeof part.text === "string") {
+      return [{ type: "input_text", text: part.text }];
+    }
+
+    if (part.type === "image_url" && part.image_url?.url) {
+      return [{ type: "input_image", image_url: { url: part.image_url.url } }];
+    }
+
+    return [];
+  });
+}
+
+function responsesAssistantText(content: ApiMessage["content"]): string {
+  if (typeof content === "string") {
+    return content;
+  }
+
+  if (!Array.isArray(content)) {
+    return "";
+  }
+
+  return content
+    .filter((part): part is OpenAiContentPart & { text: string } => part.type === "text" && typeof part.text === "string")
+    .map((part) => part.text)
+    .join("");
+}
+
+function buildGoogleGenerateContentBody(
+  messages: ApiMessage[],
+  options: vscode.ProvideLanguageModelChatResponseOptions,
+  settings: ApiSettings,
+  limits: ModelLimits,
+): Record<string, unknown> {
+  const tools = mapGoogleTools(options.tools);
+
+  return {
+    contents: googleContentsFromMessages(messages),
+    generationConfig: {
+      maxOutputTokens: limits.maxOutputTokens,
+      temperature: settings.temperature,
+    },
+    ...(tools.length ? { tools: [{ functionDeclarations: tools }], toolConfig: googleToolConfig(options.toolMode) } : {}),
+  };
+}
+
+function mapGoogleTools(tools: readonly vscode.LanguageModelChatTool[] | undefined): Array<Record<string, unknown>> {
+  return (tools ?? []).map((tool) => ({
+    name: tool.name,
+    description: tool.description,
+    parameters: sanitizeToolSchema(tool.inputSchema),
+  }));
+}
+
+function googleToolConfig(mode: vscode.LanguageModelChatToolMode): Record<string, unknown> {
+  return {
+    functionCallingConfig: {
+      mode: mode === vscode.LanguageModelChatToolMode.Required ? "ANY" : "AUTO",
+    },
+  };
+}
+
+function googleContentsFromMessages(messages: ApiMessage[]): Array<Record<string, unknown>> {
+  const toolNamesById = new Map<string, string>();
+  const contents: Array<Record<string, unknown>> = [];
+
+  for (const message of messages) {
+    if (message.role === "user") {
+      const parts = googleUserParts(message.content);
+      if (parts.length) {
+        contents.push({ role: "user", parts });
+      }
+      continue;
+    }
+
+    if (message.role === "assistant") {
+      const parts: Array<Record<string, unknown>> = [];
+      if (typeof message.reasoning_content === "string" && message.reasoning_content.trim()) {
+        parts.push({ text: message.reasoning_content, thought: true });
+      }
+      const text = responsesAssistantText(message.content);
+      if (text) {
+        parts.push({ text });
+      }
+      for (const toolCall of message.tool_calls ?? []) {
+        const args = parseToolInput(toolCall.function.arguments);
+        parts.push({ functionCall: { name: toolCall.function.name, args } });
+        toolNamesById.set(toolCall.id, toolCall.function.name);
+      }
+      if (parts.length) {
+        contents.push({ role: "model", parts });
+      }
+      continue;
+    }
+
+    if (message.role === "tool" && message.tool_call_id) {
+      const name = toolNamesById.get(message.tool_call_id) ?? "tool";
+      const content = typeof message.content === "string" ? message.content : JSON.stringify(message.content ?? "");
+      contents.push({
+        role: "user",
+        parts: [{
+          functionResponse: {
+            name,
+            response: { name, content },
+          },
+        }],
+      });
+    }
+  }
+
+  return contents;
+}
+
+function googleUserParts(content: ApiMessage["content"]): Array<Record<string, unknown>> {
+  if (typeof content === "string") {
+    return content ? [{ text: content }] : [];
+  }
+
+  if (!Array.isArray(content)) {
+    return [];
+  }
+
+  return content.flatMap((part): Array<Record<string, unknown>> => {
+    if (part.type === "text" && typeof part.text === "string") {
+      return [{ text: part.text }];
+    }
+
+    if (part.type === "image_url" && part.image_url?.url) {
+      const inlineData = dataUrlToInlineData(part.image_url.url);
+      return inlineData ? [{ inlineData }] : [];
+    }
+
+    return [];
+  });
+}
+
+function dataUrlToInlineData(url: string): { mimeType: string; data: string } | undefined {
+  const match = /^data:(.+?);base64,(.+)$/i.exec(url);
+  if (!match) {
+    return undefined;
+  }
+  return {
+    mimeType: match[1],
+    data: match[2],
+  };
+}
+
+// The official OpenCode client sends these headers on every request. The Zen
+// gateway reads x-opencode-session first, then converts that sticky identifier
+// into provider-specific affinity headers such as x-session-affinity upstream.
+//
+// VS Code's provider API does not currently expose a guaranteed public session
+// identifier everywhere, so we first probe a few known internal fields and then
+// fall back to a stable hash of the first messages in the conversation. That
+// preserves sticky routing and cache affinity without depending on hidden state.
+function buildOpenCodeRequestHeaders(
+  messages: readonly vscode.LanguageModelChatRequestMessage[],
+  options: vscode.ProvideLanguageModelChatResponseOptions,
+  modelId: string,
+): Record<string, string> {
+  const sessionId = cleanHeaderValue(
+    findStringOption(options, [
+      "sessionId",
+      "sessionID",
+      "chatSessionId",
+      "chatSessionID",
+      "conversationId",
+      "conversationID",
+      "threadId",
+      "threadID",
+      "session.id",
+      "chatSession.id",
+    ]) ?? `vscode-${stableHash(conversationAnchor(messages, modelId))}`,
+  );
+  const requestId = cleanHeaderValue(
+    findStringOption(options, [
+      "requestId",
+      "requestID",
+      "messageId",
+      "messageID",
+    ]) ??
+      `req-${stableHash(`${Date.now()}-${Math.random()}-${sessionId}-${modelId}`)}`,
+  );
+
+  return {
+    "x-opencode-session": sessionId,
+    "x-opencode-request": requestId,
+    "x-opencode-client": OPEN_CODE_CLIENT,
+    "User-Agent": OPEN_CODE_USER_AGENT,
+  };
+}
+
+function findStringOption(
+  options: unknown,
+  paths: string[],
+): string | undefined {
+  for (const path of paths) {
+    const value = readPath(options, path.split("."));
+    if (typeof value === "string" && value.trim()) {
+      return value.trim();
+    }
+  }
+  return undefined;
+}
+
+function readPath(value: unknown, path: string[]): unknown {
+  let current = value;
+  for (const segment of path) {
+    if (!isRecord(current)) {
+      return undefined;
+    }
+    current = current[segment];
+  }
+  return current;
+}
+
+function conversationAnchor(
+  messages: readonly vscode.LanguageModelChatRequestMessage[],
+  modelId: string,
+): string {
+  const anchorMessages = messages
+    .slice(0, 3)
+    .map((message) => `${message.role}:${messageText(message).slice(0, 2048)}`);
+  return anchorMessages.length ? anchorMessages.join("\n") : modelId;
+}
+
+function cleanHeaderValue(value: string): string {
+  const cleaned = value.replace(/[\r\n]/g, " ").trim();
+  return cleaned ? cleaned.slice(0, 256) : "unknown";
+}
+
+function stableHash(value: string): string {
+  let hash = 0x811c9dc5;
+  for (let index = 0; index < value.length; index++) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return (hash >>> 0).toString(16).padStart(8, "0");
 }
 
 function mapOpenAiTools(tools: readonly vscode.LanguageModelChatTool[] | undefined): OpenAiToolDefinition[] {
@@ -1022,38 +1608,77 @@ async function streamOpenCodeResponse(
   providerDisplayName: string,
   apiKey: string,
   body: unknown,
+  requestHeaders: Record<string, string>,
   progress: vscode.Progress<vscode.LanguageModelResponsePart>,
   token: vscode.CancellationToken,
   extractStreamParts: (data: unknown) => vscode.LanguageModelResponsePart[],
   extractFullParts: (data: unknown) => vscode.LanguageModelResponsePart[],
   output?: vscode.OutputChannel,
-  verbose: boolean = false
+  verbose: boolean = false,
+  requestTimeoutMs = DEFAULT_REQUEST_TIMEOUT_MS,
+  streamIdleTimeoutMs = DEFAULT_STREAM_IDLE_TIMEOUT_MS,
+  authHeaders: Record<string, string> = { Authorization: `Bearer ${apiKey}` },
 ): Promise<void> {
   const controller = new AbortController();
-  const cancellation = token.onCancellationRequested(() => controller.abort());
+  let abortReason:
+    | "request-timeout"
+    | "stream-idle-timeout"
+    | "cancelled"
+    | undefined;
+  const abort = (reason: typeof abortReason) => {
+    abortReason ??= reason;
+    controller.abort();
+  };
+  const cancellation = token.onCancellationRequested(() => abort("cancelled"));
+  const requestTimeout = setTimeout(
+    () => abort("request-timeout"),
+    requestTimeoutMs,
+  );
+  let streamIdleTimeout: ReturnType<typeof setTimeout> | undefined;
+  const resetStreamIdleTimeout = () => {
+    if (streamIdleTimeout) {
+      clearTimeout(streamIdleTimeout);
+    }
+    streamIdleTimeout = setTimeout(
+      () => abort("stream-idle-timeout"),
+      streamIdleTimeoutMs,
+    );
+  };
 
   try {
     const payload = JSON.stringify(body);
-    output?.appendLine(`[request] url=${url} payloadBytes=${payload.length}`);
+    output?.appendLine(`[request] url=${url} payloadBytes=${payload.length} requestTimeoutMs=${requestTimeoutMs} streamIdleTimeoutMs=${streamIdleTimeoutMs}`);
     const response = await fetch(url, {
       method: "POST",
       headers: {
-        "Authorization": `Bearer ${apiKey}`,
-        "Content-Type": "application/json"
+        ...authHeaders,
+        "Content-Type": "application/json",
+        ...requestHeaders,
       },
       body: payload,
       signal: controller.signal
     });
 
     output?.appendLine(`[http] ${response.status} ${response.statusText} content-type=${response.headers.get("content-type") ?? "<none>"}`);
+    const rateLimitSummary = formatRateLimitSummary(
+      readRateLimitInfo(response.headers),
+    );
+    if (rateLimitSummary) {
+      output?.appendLine(`[rate-limit] ${rateLimitSummary}`);
+    }
 
     if (!response.ok) {
       const detail = await response.text();
       const modelId = (isRecord(body) && typeof (body as { model?: unknown }).model === "string") ? (body as { model: string }).model : undefined;
-      const modelHint = modelId ? ` model=${modelId}` : "";
-      const sizeHint = ` payloadBytes=${payload.length}`;
       const capacityHint = (modelId && CAPACITY_LIMITED_MODEL_NOTES[modelId] && response.status >= 500) ? ` — ${CAPACITY_LIMITED_MODEL_NOTES[modelId]}` : "";
-      throw new Error(`${providerDisplayName} API request failed (${response.status})${modelHint}${sizeHint}${capacityHint}: ${detail || response.statusText}`);
+      throw buildOpenCodeRequestError(
+        providerDisplayName,
+        response,
+        detail,
+        modelId,
+        payload.length,
+        capacityHint,
+      );
     }
 
     const contentType = response.headers.get("content-type") ?? "";
@@ -1075,12 +1700,14 @@ async function streamOpenCodeResponse(
     let buffer = "";
     let totalBytes = 0;
     let totalEvents = 0;
+    resetStreamIdleTimeout();
 
     while (!token.isCancellationRequested) {
       const { value, done } = await reader.read();
       if (done) {
         break;
       }
+      resetStreamIdleTimeout();
 
       totalBytes += value?.byteLength ?? 0;
       const chunk = decoder.decode(value, { stream: true });
@@ -1114,14 +1741,30 @@ async function streamOpenCodeResponse(
     if (output) {
       output.appendLine(`[sse-stats] totalBytes=${totalBytes} totalEvents=${totalEvents} bufferTailLen=${buffer.length}`);
     }
+  } catch (error) {
+    if (abortReason === "cancelled") {
+      return;
+    }
+    if (abortReason === "request-timeout") {
+      throw new OpenCodeRequestError(
+        `${providerDisplayName} request timed out after ${formatDuration(requestTimeoutMs)}.`,
+        `${providerDisplayName} did not start or finish the request within ${formatDuration(requestTimeoutMs)}. Try again later or reduce the request size.`,
+      );
+    }
+    if (abortReason === "stream-idle-timeout") {
+      throw new OpenCodeRequestError(
+        `${providerDisplayName} stream stalled for ${formatDuration(streamIdleTimeoutMs)} without new data.`,
+        `${providerDisplayName} stopped sending stream data for ${formatDuration(streamIdleTimeoutMs)}, so the request was cancelled to avoid leaving Copilot stuck.`,
+      );
+    }
+    throw error;
   } finally {
+    clearTimeout(requestTimeout);
+    if (streamIdleTimeout) {
+      clearTimeout(streamIdleTimeout);
+    }
     cancellation.dispose();
   }
-}
-
-function truncateForLog(value: string, max = 1200): string {
-  const collapsed = value.replace(/\s+/g, " ").trim();
-  return collapsed.length > max ? `${collapsed.slice(0, max)}… (+${collapsed.length - max} chars)` : collapsed;
 }
 
 function parseServerSentEvent(
@@ -1776,6 +2419,16 @@ function getSettings(): ApiSettings {
     maxOutputTokensOverride: config.get("maxTokens", 0),
     maxInputTokensOverride: config.get("maxInputTokens", 0),
     debugReasoning: config.get("debugReasoning", false),
+    requestTimeoutMs:
+      Math.max(config.get("requestTimeoutSeconds", DEFAULT_REQUEST_TIMEOUT_MS / 1000), 1) * 1000,
+    streamIdleTimeoutMs:
+      Math.max(
+        config.get(
+          "streamIdleTimeoutSeconds",
+          DEFAULT_STREAM_IDLE_TIMEOUT_MS / 1000,
+        ),
+        1,
+      ) * 1000,
     thinking: {
       deepseek: config.get<ThinkingSettings["deepseek"]>("thinking.deepseek", "off"),
       glm: config.get<ThinkingSettings["glm"]>("thinking.glm", "off"),
@@ -1829,13 +2482,11 @@ function isQwenModel(modelId: string): boolean {
 }
 
 function modelLimits(
-  modelId: string,
+  metadata: ResolvedModelMetadata,
   settings = getSettings(),
-  vendor: ProviderDefinition["vendor"] = ZEN_VENDOR
 ): ModelLimits {
-  const limits = MODEL_LIMITS_BY_PROVIDER[vendor][modelId] ?? DEFAULT_MODEL_LIMITS;
-  const contextWindow = positiveOverride(settings.maxInputTokensOverride) ?? limits.contextWindow;
-  const maxOutputTokens = positiveOverride(settings.maxOutputTokensOverride) ?? limits.maxOutputTokens;
+  const contextWindow = positiveOverride(settings.maxInputTokensOverride) ?? metadata.contextWindow;
+  const maxOutputTokens = positiveOverride(settings.maxOutputTokensOverride) ?? metadata.maxOutputTokens;
   const apiMaxOutputTokens = Math.min(maxOutputTokens, contextWindow);
   // advertisedContextWindow = actual model context window (not inflated).
   // Adding apiMaxOutputTokens here inflates the value above the real limit,
@@ -1875,8 +2526,8 @@ function positiveOverride(value: number): number | undefined {
   return Number.isFinite(value) && value > 0 ? Math.floor(value) : undefined;
 }
 
-function modelCapabilities(modelId: string): CopilotCompatibleCapabilities {
-  const supportsVision = VISION_CAPABLE_MODELS.has(modelId);
+function modelCapabilities(metadata: ResolvedModelMetadata): CopilotCompatibleCapabilities {
+  const supportsVision = metadata.supportsVision;
   return {
     imageInput: supportsVision,
     toolCalling: 128,
@@ -1885,16 +2536,15 @@ function modelCapabilities(modelId: string): CopilotCompatibleCapabilities {
   };
 }
 
-function modelEndpointKind(modelId: string, provider: ProviderDefinition): OpenCodeModel["endpointKind"] {
-  if (provider.vendor === GO_VENDOR && modelId.startsWith("minimax-m2.")) {
-    return "messages";
+function shouldHideDeprecatedModel(
+  modelId: string,
+  vendor: ProviderDefinition["vendor"],
+  snapshot: CachedModelMetadataSnapshot,
+): boolean {
+  if (vendor !== ZEN_VENDOR) {
+    return false;
   }
-
-  return "chat-completions";
-}
-
-function toEffectiveModelId(modelId: string, vendor: ProviderDefinition["vendor"]): string {
-  return `${vendor}:${modelId}::${MODEL_METADATA_REVISION}`;
+  return snapshot.providers[vendor][modelId]?.status === "deprecated";
 }
 
 function resolveRawModelId(modelId: string): string {
@@ -1908,10 +2558,6 @@ function resolveRawModelId(modelId: string): string {
     return base.slice(zenPrefix.length);
   }
   return base;
-}
-
-function hasExplicitModelLimits(modelId: string, vendor: ProviderDefinition["vendor"]): boolean {
-  return Boolean(MODEL_LIMITS_BY_PROVIDER[vendor][modelId]);
 }
 
 function isFreeZenModel(modelId: string): boolean {

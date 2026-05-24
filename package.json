@@ -2,7 +2,7 @@
   "name": "opencode-copilot-chat",
   "displayName": "OpenCode Copilot Chat",
   "description": "Bring your own OpenCode API key to VS Code Copilot Chat. Adds OpenCode Go and OpenCode Zen models through the Language Model Chat Provider API.",
-  "version": "0.1.4",
+  "version": "0.1.6",
   "publisher": "ltmoerdani",
   "license": "MIT",
   "icon": "media/opencodego.png",
@@ -41,6 +41,7 @@
     "onCommand:opencodego.diagnostics",
     "onCommand:opencodego.setApiKey",
     "onCommand:opencodezen.diagnostics",
+    "onCommand:opencodego.modelPickerDiagnostics",
     "onCommand:opencodego.setThinkingEffort",
     "onLanguageModelChatProvider:opencodego",
     "onLanguageModelChatProvider:opencodezen"
@@ -99,6 +100,18 @@
           "type": "boolean",
           "default": false,
           "description": "Write provider reasoning_content to the OpenCode output channel for debugging. Reasoning is not shown in Copilot Chat."
+        },
+        "opencodego.requestTimeoutSeconds": {
+          "type": "number",
+          "default": 600,
+          "minimum": 1,
+          "description": "Total request timeout in seconds for OpenCode Go and Zen chat requests. Prevents long-running Copilot requests from hanging indefinitely."
+        },
+        "opencodego.streamIdleTimeoutSeconds": {
+          "type": "number",
+          "default": 120,
+          "minimum": 1,
+          "description": "Streaming idle timeout in seconds. If OpenCode stops sending response chunks for this long, the request is cancelled with a clear error."
         },
         "opencodego.freeOnly": {
           "type": "boolean",
@@ -178,6 +191,7 @@
   },
   "scripts": {
     "compile": "tsc -p ./",
+    "test": "npm run compile && node --test",
     "watch": "tsc -watch -p ./",
     "package": "vsce package",
     "vscode:prepublish": "npm run compile"
