@@ -30,7 +30,7 @@ This lets you pick and use OpenCode models directly from the Copilot Chat model 
 - **Tool-calling support** — forwards tool schemas using the request shape each routed model family expects
 - **Native transport compatibility** — routes Zen GPT to `/responses`, Zen Gemini to the documented Google-style endpoint, Zen Claude to `/messages`, Go MiniMax to `/messages`, and the remaining models to `/chat/completions`
 - **Safer requests** — adds sticky routing headers plus request and stream idle timeouts with clearer rate-limit/quota errors in VS Code
-- **Diagnostics command** — one-click markdown report showing exactly which models VS Code has registered
+- **Diagnostics command** — one-click markdown report showing exactly which models VS Code has registered plus recent request summaries for transport, tokens, latency, and errors
 
 ---
 
@@ -72,8 +72,8 @@ For advanced usage, you can also run these commands via the Command Palette (`Cm
 |---|---|
 | `OpenCode Go: Manage Provider` | Manage legacy fallback API key, refresh models, or test connection |
 | `OpenCode Go: Set API Key` | Store or update a legacy fallback OpenCode Go API key |
-| `OpenCode Go: Diagnostics` | Show a markdown report of all registered OpenCode Go models |
-| `OpenCode Zen: Diagnostics` | Show a markdown report of all registered OpenCode Zen models |
+| `OpenCode Go: Diagnostics` | Show a markdown report of registered OpenCode Go models and recent Go request summaries |
+| `OpenCode Zen: Diagnostics` | Show a markdown report of registered OpenCode Zen models and recent Zen request summaries |
 
 > **Note:** The native BYOK flow via **Language Models** (gear icon ⚙) is recommended. VS Code will ask for a group name, then the matching API key. Go and Zen are separate provider groups, so both can be active at the same time.
 
