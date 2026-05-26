@@ -31,6 +31,9 @@ This lets you pick and use OpenCode models directly from the Copilot Chat model 
 - **Native transport compatibility** — routes Zen GPT to `/responses`, Zen Gemini to the documented Google-style endpoint, Zen Claude to `/messages`, Go MiniMax to `/messages`, and the remaining models to `/chat/completions`
 - **Safer requests** — adds sticky routing headers plus request and stream idle timeouts with clearer rate-limit/quota errors in VS Code
 - **Diagnostics command** — one-click markdown report showing exactly which models VS Code has registered plus recent request summaries for transport, tokens, latency, and errors
+- **Usage status bar** — shows the latest prompt/output/total/cache summary after each OpenCode response
+- **Normalized usage markers** — emits a normalized usage data part for each response so future Copilot/BYOK integrations can consume prompt/output/cache metadata directly
+- **Experimental context footer hook** — optional opt-in integration that attempts to fill the Copilot Chat footer with real BYOK usage using VS Code internals
 
 ---
 
@@ -89,7 +92,11 @@ For advanced usage, you can also run these commands via the Command Palette (`Cm
 | `opencodego.debugReasoning` | `boolean` | `false` | Write provider `reasoning_content` to **Output → OpenCode** for debugging |
 | `opencodego.requestTimeoutSeconds` | `number` | `600` | Total request timeout for OpenCode Go and Zen API calls |
 | `opencodego.streamIdleTimeoutSeconds` | `number` | `120` | Cancels a request if the response stream stops sending chunks for too long |
+| `opencodego.showUsageStatusBar` | `boolean` | `true` | Show the latest OpenCode usage summary in the VS Code status bar |
+| `opencodego.experimentalContextIndicator` | `boolean` | `false` | Experimental attempt to fill the Copilot Chat context indicator with real BYOK token usage |
 | `opencodego.freeOnly`      | `boolean` | `true`  | Limit OpenCode Zen to free models only. Disable to include paid Zen models in the picker |
+
+When `opencodego.experimentalContextIndicator` is enabled, the extension installs an internal bridge that maps OpenCode request ids back to VS Code chat request ids and injects normalized prompt/output usage into the Copilot Chat footer. This path is intentionally opt-in because it depends on VS Code internals and can break across updates.
 
 ---
 

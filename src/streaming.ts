@@ -13,6 +13,14 @@ import {
   normalizeResponsesFullResponse,
   normalizeResponsesStreamEvent,
 } from "./routing";
+import { createUsageDataPart } from "./chatParts";
+import {
+  clearContextWindowRequest,
+  reportProgressWithContextWindowRequest,
+  reportUsageToContextWindowForRequest,
+  setContextWindowOutputBufferForRequest,
+} from "./contextWindowHookBridge";
+import { formatUsageLogLine } from "./usage";
 
 export interface StreamRequestOptions {
   url: string;
@@ -21,12 +29,13 @@ export interface StreamRequestOptions {
   modelId: string;
   body: unknown;
   requestHeaders: Record<string, string>;
-  progress: vscode.Progress<vscode.LanguageModelResponsePart>;
+  progress: vscode.Progress<vscode.LanguageModelResponsePart2>;
   token: vscode.CancellationToken;
   output?: vscode.OutputChannel;
   debugReasoning: boolean;
   requestTimeoutMs: number;
   streamIdleTimeoutMs: number;
+  contextWindowOutputBuffer?: number;
   authHeaders?: Record<string, string>;
   onReasoningContent?: (toolCallIds: string[], reasoningContent: string) => void;
   capacityLimitedModelNotes?: Record<string, string>;
@@ -70,7 +79,10 @@ export async function streamChatCompletions(
     extractFullParts: extractChatCompletionParts,
   });
 
-  extractor.flushReasoningFallback(options.progress);
+  extractor.flushReasoningFallback(
+    options.progress,
+    options.requestHeaders["x-opencode-request"],
+  );
   options.output?.appendLine(
     `[stream-summary model=${options.modelId}] textChars=${extractor.emittedText} toolCalls=${extractor.emittedTools} reasoningChars=${extractor.reasoningChars}`,
   );
@@ -105,7 +117,10 @@ export async function streamChatCompletionsWithAnthropicStream(
     },
   });
 
-  openAiExtractor.flushReasoningFallback(options.progress);
+  openAiExtractor.flushReasoningFallback(
+    options.progress,
+    options.requestHeaders["x-opencode-request"],
+  );
   const emittedText =
     openAiExtractor.emittedText + anthropicExtractor.emittedText;
   options.output?.appendLine(
@@ -147,7 +162,10 @@ export async function streamResponsesApi(
       extractChatCompletionParts(normalizeResponsesFullResponse(data)),
   });
 
-  extractor.flushReasoningFallback(options.progress);
+  extractor.flushReasoningFallback(
+    options.progress,
+    options.requestHeaders["x-opencode-request"],
+  );
   options.output?.appendLine(
     `[stream-summary model=${options.modelId}] textChars=${extractor.emittedText} toolCalls=${extractor.emittedTools} reasoningChars=${extractor.reasoningChars}`,
   );
@@ -170,7 +188,10 @@ export async function streamGoogleGenerateContent(
       extractChatCompletionParts(normalizeGoogleFullResponse(data)),
   });
 
-  extractor.flushReasoningFallback(options.progress);
+  extractor.flushReasoningFallback(
+    options.progress,
+    options.requestHeaders["x-opencode-request"],
+  );
   options.output?.appendLine(
     `[stream-summary model=${options.modelId}] textChars=${extractor.emittedText} toolCalls=${extractor.emittedTools} reasoningChars=${extractor.reasoningChars}`,
   );
@@ -189,11 +210,25 @@ interface RequestUsageSummary {
   finishReason?: string;
 }
 
+function reportProgressPart(
+  localRequestId: string | undefined,
+  progress: vscode.Progress<vscode.LanguageModelResponsePart2>,
+  part: vscode.LanguageModelResponsePart2,
+): void {
+  if (!localRequestId) {
+    progress.report(part);
+    return;
+  }
+
+  reportProgressWithContextWindowRequest(localRequestId, progress, part);
+}
+
 async function streamOpenCodeResponse(
   options: StreamOpenCodeResponseOptions,
 ): Promise<void> {
   const controller = new AbortController();
   const startedAt = Date.now();
+  const localRequestId = options.requestHeaders["x-opencode-request"];
   let firstByteAt: number | undefined;
   const usageSummary: RequestUsageSummary = {};
   let abortReason:
@@ -271,10 +306,51 @@ async function streamOpenCodeResponse(
     options.output?.appendLine(
       `[response-summary] status=${summary.status ?? "n/a"} durationMs=${summary.durationMs} ttfbMs=${summary.ttfbMs ?? "n/a"} promptTokens=${summary.promptTokens ?? "n/a"} completionTokens=${summary.completionTokens ?? "n/a"} totalTokens=${summary.totalTokens ?? "n/a"} cachedTokens=${summary.cachedTokens ?? "n/a"} finishReason=${summary.finishReason ?? "<unknown>"} totalBytes=${summary.totalBytes} totalEvents=${summary.totalEvents}`,
     );
+    const usageLog = formatUsageLogLine({
+      promptTokens: summary.promptTokens,
+      completionTokens: summary.completionTokens,
+      totalTokens: summary.totalTokens,
+      cachedTokens: summary.cachedTokens,
+      finishReason: summary.finishReason,
+    });
+    if (usageLog) {
+      options.output?.appendLine(`[usage] ${usageLog}`);
+    }
     options.onTransportSummary?.(summary);
+
+    if (localRequestId) {
+      reportUsageToContextWindowForRequest(localRequestId, {
+        promptTokens: summary.promptTokens,
+        completionTokens: summary.completionTokens,
+        totalTokens: summary.totalTokens,
+        cachedTokens: summary.cachedTokens,
+        finishReason: summary.finishReason,
+      });
+    }
+
+    const usagePart =
+      summary.errorMessage || summary.abortedReason
+        ? undefined
+        : createUsageDataPart({
+            promptTokens: summary.promptTokens,
+            completionTokens: summary.completionTokens,
+            totalTokens: summary.totalTokens,
+            cachedTokens: summary.cachedTokens,
+            finishReason: summary.finishReason,
+          });
+    if (usagePart) {
+      reportProgressPart(localRequestId, options.progress, usagePart);
+    }
   };
 
   try {
+    if (localRequestId && options.contextWindowOutputBuffer !== undefined) {
+      setContextWindowOutputBufferForRequest(
+        localRequestId,
+        options.contextWindowOutputBuffer,
+      );
+    }
+
     const payload = JSON.stringify(options.body);
     options.output?.appendLine(
       `[request] url=${options.url} payloadBytes=${payload.length} requestTimeoutMs=${options.requestTimeoutMs} streamIdleTimeoutMs=${options.streamIdleTimeoutMs}`,
@@ -336,7 +412,7 @@ async function streamOpenCodeResponse(
       if (data !== undefined) {
         updateRequestUsageSummary(usageSummary, data);
         for (const part of options.extractFullParts(data)) {
-          options.progress.report(part);
+          reportProgressPart(localRequestId, options.progress, part);
         }
       }
       emitSummary(new TextEncoder().encode(raw).byteLength, data === undefined ? 0 : 1, {
@@ -383,7 +459,7 @@ async function streamOpenCodeResponse(
           options.extractStreamParts,
           (data) => updateRequestUsageSummary(usageSummary, data),
         )) {
-          options.progress.report(part);
+          reportProgressPart(localRequestId, options.progress, part);
         }
       }
     }
@@ -397,7 +473,7 @@ async function streamOpenCodeResponse(
         options.extractStreamParts,
         (data) => updateRequestUsageSummary(usageSummary, data),
       )) {
-        options.progress.report(part);
+        reportProgressPart(localRequestId, options.progress, part);
       }
     }
 
@@ -445,6 +521,9 @@ async function streamOpenCodeResponse(
       clearTimeout(streamIdleTimeout);
     }
     cancellation.dispose();
+    if (localRequestId) {
+      clearContextWindowRequest(localRequestId);
+    }
   }
 }
 
@@ -567,7 +646,8 @@ class OpenAiResponseExtractor {
   }
 
   flushReasoningFallback(
-    progress: vscode.Progress<vscode.LanguageModelResponsePart>,
+    progress: vscode.Progress<vscode.LanguageModelResponsePart2>,
+    localRequestId?: string,
   ): void {
     const reasoning = this.reasoningContent.trim();
     if (!reasoning) {
@@ -578,7 +658,11 @@ class OpenAiResponseExtractor {
       return;
     }
     this.onReasoningDebug?.(this.reasoningContent);
-    progress.report(new vscode.LanguageModelTextPart(reasoning));
+    reportProgressPart(
+      localRequestId,
+      progress,
+      new vscode.LanguageModelTextPart(reasoning),
+    );
     this.emittedTextLength += reasoning.length;
     this.reasoningContent = "";
   }

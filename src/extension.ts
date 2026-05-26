@@ -28,10 +28,23 @@ import {
   type TransportRequestSummary,
 } from "./streaming";
 import { GO_VENDOR, ZEN_VENDOR } from "./providerTypes";
+import { isInternalDataPart } from "./chatParts";
+import {
+  disposeContextWindowHookBridge,
+  initializeContextWindowHookBridge,
+} from "./contextWindowHookBridge";
+import {
+  formatCacheHitRatio,
+  formatUsageStatusBarText,
+  formatUsageStatusBarTooltip,
+  type UsageSnapshot,
+} from "./usage";
 
 const SECRET_KEY = "opencodego.apiKey";
 const RECENT_TRANSPORT_SUMMARY_LIMIT = 25;
 const RECENT_TRANSPORT_SUMMARY_STORAGE_PREFIX = "opencode.recentTransportSummaries";
+
+let usageStatusBarItem: vscode.StatusBarItem | undefined;
 
 interface ProviderDefinition {
   vendor: typeof GO_VENDOR | typeof ZEN_VENDOR;
@@ -301,6 +314,8 @@ interface RecentTransportSummary extends TransportRequestSummary {
 }
 
 export function activate(context: vscode.ExtensionContext) {
+  ensureUsageStatusBar(context);
+  void syncExperimentalContextIndicator();
   const goProvider = new OpenCodeProvider(context, PROVIDERS[GO_VENDOR]);
   const zenProvider = new OpenCodeProvider(context, PROVIDERS[ZEN_VENDOR]);
 
@@ -313,6 +328,17 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand("opencodezen.diagnostics", () => zenProvider.showDiagnostics()),
     vscode.commands.registerCommand("opencodego.modelPickerDiagnostics", () => showModelPickerDiagnostics()),
     vscode.commands.registerCommand("opencodego.setThinkingEffort", () => showThinkingEffortPicker())
+  );
+
+  context.subscriptions.push(
+    vscode.workspace.onDidChangeConfiguration((event) => {
+      if (event.affectsConfiguration("opencodego.showUsageStatusBar")) {
+        resetUsageStatusBar();
+      }
+      if (event.affectsConfiguration("opencodego.experimentalContextIndicator")) {
+        void syncExperimentalContextIndicator();
+      }
+    }),
   );
 
   void warmModelPickerMetadata();
@@ -382,8 +408,91 @@ async function showThinkingEffortPicker(): Promise<void> {
   vscode.window.showInformationMessage(`OpenCode Thinking — ${family.family.label}: ${choice}`);
 }
 
-export function deactivate() {
-  // Nothing to clean up.
+export async function deactivate(): Promise<void> {
+  await disposeContextWindowHookBridge();
+}
+
+function ensureUsageStatusBar(
+  context: vscode.ExtensionContext,
+): vscode.StatusBarItem {
+  if (!usageStatusBarItem) {
+    usageStatusBarItem = vscode.window.createStatusBarItem(
+      vscode.StatusBarAlignment.Right,
+      95,
+    );
+    context.subscriptions.push(usageStatusBarItem);
+  }
+
+  resetUsageStatusBar();
+  return usageStatusBarItem;
+}
+
+function shouldShowUsageStatusBar(): boolean {
+  return vscode.workspace
+    .getConfiguration("opencodego")
+    .get("showUsageStatusBar", true);
+}
+
+function isExperimentalContextIndicatorEnabled(): boolean {
+  return vscode.workspace
+    .getConfiguration("opencodego")
+    .get("experimentalContextIndicator", false);
+}
+
+async function syncExperimentalContextIndicator(): Promise<void> {
+  if (isExperimentalContextIndicatorEnabled()) {
+    await initializeContextWindowHookBridge();
+    return;
+  }
+
+  await disposeContextWindowHookBridge();
+}
+
+function resetUsageStatusBar(): void {
+  if (!usageStatusBarItem) {
+    return;
+  }
+
+  if (!shouldShowUsageStatusBar()) {
+    usageStatusBarItem.hide();
+    return;
+  }
+
+  usageStatusBarItem.text = "OpenCode";
+  usageStatusBarItem.tooltip = "OpenCode usage summary";
+  usageStatusBarItem.show();
+}
+
+function updateUsageStatusBar(
+  providerDisplayName: string,
+  modelId: string,
+  summary: TransportRequestSummary,
+): void {
+  if (!usageStatusBarItem) {
+    return;
+  }
+
+  if (!shouldShowUsageStatusBar()) {
+    usageStatusBarItem.hide();
+    return;
+  }
+
+  const usage: UsageSnapshot = {
+    promptTokens: summary.promptTokens,
+    completionTokens: summary.completionTokens,
+    totalTokens: summary.totalTokens,
+    cachedTokens: summary.cachedTokens,
+    finishReason: summary.finishReason,
+  };
+  const text = formatUsageStatusBarText(providerDisplayName, usage);
+
+  usageStatusBarItem.text = text ?? providerDisplayName;
+  usageStatusBarItem.tooltip = formatUsageStatusBarTooltip(
+    providerDisplayName,
+    modelId,
+    usage,
+  );
+  usageStatusBarItem.show();
 }
 
 class OpenCodeProvider implements vscode.LanguageModelChatProvider<OpenCodeModel> {
@@ -509,6 +618,10 @@ class OpenCodeProvider implements vscode.LanguageModelChatProvider<OpenCodeModel
       .reverse()
       .flatMap((summary, index) => {
         const status = summary.status ?? summary.abortedReason ?? "n/a";
+        const cacheHitRatio = formatCacheHitRatio({
+          promptTokens: summary.promptTokens,
+          cachedTokens: summary.cachedTokens,
+        });
         const lines = [
           `### ${index + 1}. ${summary.modelId}`,
           "",
@@ -522,6 +635,7 @@ class OpenCodeProvider implements vscode.LanguageModelChatProvider<OpenCodeModel
           `- totalBytes: ${summary.totalBytes}`,
           `- totalEvents: ${summary.totalEvents}`,
           `- tokens: prompt=${summary.promptTokens ?? "n/a"}, completion=${summary.completionTokens ?? "n/a"}, total=${summary.totalTokens ?? "n/a"}, cached=${summary.cachedTokens ?? "n/a"}`,
+          `- cacheHitRatio: ${cacheHitRatio ?? "n/a"}`,
           `- finishReason: ${summary.finishReason ?? "n/a"}`,
           `- requestId: ${summary.requestId ?? "n/a"}`,
           `- sessionId: ${summary.sessionId ?? "n/a"}`,
@@ -763,7 +877,7 @@ class OpenCodeProvider implements vscode.LanguageModelChatProvider<OpenCodeModel
     model: OpenCodeModel,
     messages: readonly vscode.LanguageModelChatRequestMessage[],
     options: vscode.ProvideLanguageModelChatResponseOptions,
-    progress: vscode.Progress<vscode.LanguageModelResponsePart>,
+    progress: vscode.Progress<vscode.LanguageModelResponsePart2>,
     token: vscode.CancellationToken
   ): Promise<void> {
     const apiKey =
@@ -804,6 +918,7 @@ class OpenCodeProvider implements vscode.LanguageModelChatProvider<OpenCodeModel
         metadata.source,
         options.requestInitiator,
       );
+      updateUsageStatusBar(this.definition.displayName, rawModelId, summary);
     };
 
     this.log(`Request: initiator=${options.requestInitiator} model=${model.id} rawModel=${rawModelId} endpoint=${routing.endpointKind} metadataSource=${metadata.source} messages=${apiMessages.length} session=${requestHeaders["x-opencode-session"]} request=${requestHeaders["x-opencode-request"]} modelConfiguration=${JSON.stringify(pickThinkingModelConfiguration(requestOverride))} thinking=${JSON.stringify(settings.thinking)} thinkingPayload=${JSON.stringify(thinkingPayload)}`);
@@ -812,6 +927,8 @@ class OpenCodeProvider implements vscode.LanguageModelChatProvider<OpenCodeModel
     }
 
     try {
+      const contextWindowOutputBuffer = limits.advertisedMaxOutputTokens;
+
       if (routing.endpointKind === "messages") {
         await runStreamAnthropicMessages({
           url: routing.endpointUrl,
@@ -826,6 +943,7 @@ class OpenCodeProvider implements vscode.LanguageModelChatProvider<OpenCodeModel
           debugReasoning: settings.debugReasoning,
           requestTimeoutMs: settings.requestTimeoutMs,
           streamIdleTimeoutMs: settings.streamIdleTimeoutMs,
+          contextWindowOutputBuffer,
           authHeaders: {
             Authorization: `Bearer ${apiKey}`,
             "x-api-key": apiKey,
@@ -851,6 +969,7 @@ class OpenCodeProvider implements vscode.LanguageModelChatProvider<OpenCodeModel
           debugReasoning: settings.debugReasoning,
           requestTimeoutMs: settings.requestTimeoutMs,
           streamIdleTimeoutMs: settings.streamIdleTimeoutMs,
+          contextWindowOutputBuffer,
           capacityLimitedModelNotes: CAPACITY_LIMITED_MODEL_NOTES,
           onTransportSummary,
           onReasoningContent: (toolCallIds, reasoningContent) => {
@@ -877,6 +996,7 @@ class OpenCodeProvider implements vscode.LanguageModelChatProvider<OpenCodeModel
           debugReasoning: settings.debugReasoning,
           requestTimeoutMs: settings.requestTimeoutMs,
           streamIdleTimeoutMs: settings.streamIdleTimeoutMs,
+          contextWindowOutputBuffer,
           authHeaders: {
             Authorization: `Bearer ${apiKey}`,
             "x-goog-api-key": apiKey
@@ -906,6 +1026,7 @@ class OpenCodeProvider implements vscode.LanguageModelChatProvider<OpenCodeModel
           debugReasoning: settings.debugReasoning,
           requestTimeoutMs: settings.requestTimeoutMs,
           streamIdleTimeoutMs: settings.streamIdleTimeoutMs,
+          contextWindowOutputBuffer,
           capacityLimitedModelNotes: CAPACITY_LIMITED_MODEL_NOTES,
           onTransportSummary,
         });
@@ -926,6 +1047,7 @@ class OpenCodeProvider implements vscode.LanguageModelChatProvider<OpenCodeModel
         debugReasoning: settings.debugReasoning,
         requestTimeoutMs: settings.requestTimeoutMs,
         streamIdleTimeoutMs: settings.streamIdleTimeoutMs,
+        contextWindowOutputBuffer,
         capacityLimitedModelNotes: CAPACITY_LIMITED_MODEL_NOTES,
         onTransportSummary,
         onReasoningContent: (toolCallIds, reasoningContent) => {
@@ -1619,6 +1741,10 @@ function convertMessage(
       continue;
     }
 
+    if (part instanceof vscode.LanguageModelDataPart && isInternalDataPart(part)) {
+      continue;
+    }
+
     const text = partToText(part);
     if (text) {
       textParts.push(text);
@@ -1685,6 +1811,10 @@ function partToText(part: vscode.LanguageModelInputPart | unknown): string {
 
   if (part instanceof vscode.LanguageModelToolCallPart) {
     return `[Tool call: ${part.name} ${JSON.stringify(part.input)}]`;
+  }
+
+  if (part instanceof vscode.LanguageModelDataPart && isInternalDataPart(part)) {
+    return "";
   }
 
   if (typeof part === "string") {

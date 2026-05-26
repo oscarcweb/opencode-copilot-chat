@@ -8,11 +8,17 @@ All notable changes to the **OpenCode Go BYOK Provider** extension are documente
 
 - Added recent OpenCode transport summaries to the Go and Zen diagnostics reports, including endpoint, initiator, metadata source, request IDs, token usage, latency, and error details for the last provider requests.
 - Persist recent diagnostics request summaries in VS Code global state so the request history survives extension host reloads and can be reused if VS Code later exposes richer BYOK debug surfaces.
+- Added a usage status bar summary with prompt/output/total/cache data after each OpenCode response.
+- Added OpenCode usage DataPart emission so later Copilot Chat integrations can consume normalized prompt/output/cache metadata without re-parsing raw transport logs.
+- Added explicit follow-up TODO tracking in-repo for the next BYOK integration slices, including the experimental context-indicator hook.
+- Added an opt-in experimental context-indicator hook that can inject real BYOK usage into the Copilot Chat footer using VS Code internals.
 
 ### Changed
 
 - Extracted the OpenCode transport and SSE parsing layer into a dedicated `streaming.ts` module so provider wiring, request building, and stream normalization can evolve independently.
 - Keep capturing request usage and finish metadata even when VS Code's native Agent Debug Log does not surface custom BYOK provider telemetry.
+- Enriched OpenCode output logging with normalized usage lines, finish reasons, and cache hit ratio when the upstream provider reports cache metadata.
+- Route provider progress and usage through a local request-id bridge so the experimental context hook can bind real request usage back to VS Code's internal chat request ids.
 
 ## [0.1.6] — 2026-05-21
 
