@@ -13,7 +13,7 @@ import {
   normalizeResponsesFullResponse,
   normalizeResponsesStreamEvent,
 } from "./routing";
-import { createUsageDataPart } from "./chatParts";
+import { createUsageDataParts } from "./chatParts";
 import {
   clearContextWindowRequest,
   reportProgressWithContextWindowRequest,
@@ -299,17 +299,17 @@ async function streamOpenCodeResponse(
       });
     }
 
-    const usagePart =
+    const usageParts =
       summary.errorMessage || summary.abortedReason
-        ? undefined
-        : createUsageDataPart({
+        ? []
+        : createUsageDataParts({
             promptTokens: summary.promptTokens,
             completionTokens: summary.completionTokens,
             totalTokens: summary.totalTokens,
             cachedTokens: summary.cachedTokens,
             finishReason: summary.finishReason,
           });
-    if (usagePart) {
+    for (const usagePart of usageParts) {
       reportProgressPart(localRequestId, options.progress, usagePart);
     }
   };

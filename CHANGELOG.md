@@ -4,6 +4,8 @@ All notable changes to the **OpenCode Go BYOK Provider** extension are documente
 
 ## Unreleased
 
+## [0.1.7] — 2026-05-27
+
 ### Added
 
 - Added recent OpenCode transport summaries to the Go and Zen diagnostics reports, including endpoint, initiator, metadata source, request IDs, token usage, latency, and error details for the last provider requests.
@@ -26,6 +28,8 @@ All notable changes to the **OpenCode Go BYOK Provider** extension are documente
 - Fixed OpenCode `/messages` authentication to follow the gateway contract (`x-api-key` for Anthropic-style routes, bearer auth for OpenAI-style routes), which restores OpenCode Go `qwen3.7-max` in Copilot Chat.
 - Fixed the OpenCode `/messages` body builder to emit Anthropic-compatible message blocks instead of forwarding OpenAI-shaped payloads to that endpoint.
 - Aligned OpenCode Go and Zen Qwen routing with the current official endpoint docs: Go `qwen3.5-plus`, `qwen3.6-plus`, and `qwen3.7-max`, plus Zen `qwen3.5-plus` / `qwen3.6-plus`, now use `/messages`.
+- Report provider token usage back to VS Code via `LanguageModelDataPart` MIME `usage` so Copilot Chat's Context Window widget can display used tokens instead of staying at 0%.
+- Improved local token counting for chat messages, tool calls, tool results, JSON/data parts, and image attachments.
 - Logged raw HTTP error bodies in the OpenCode output channel so provider-specific backend failures can be diagnosed without reproducing requests manually.
 
 ## [0.1.6] — 2026-05-21

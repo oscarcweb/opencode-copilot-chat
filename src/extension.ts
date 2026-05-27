@@ -75,7 +75,7 @@ const KNOWN_UNAVAILABLE_MODEL_IDS = new Set([
 const DEFAULT_REQUEST_TIMEOUT_MS = 10 * 60 * 1000;
 const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 2 * 60 * 1000;
 const OPEN_CODE_CLIENT = "vscode-copilot-chat";
-const OPEN_CODE_USER_AGENT = "opencode-copilot-chat/0.1.6 VSCode";
+const OPEN_CODE_USER_AGENT = "opencode-copilot-chat/0.1.7 VSCode";
 
 const PROVIDERS: Record<ProviderDefinition["vendor"], ProviderDefinition> = {
   [GO_VENDOR]: {
@@ -309,6 +309,11 @@ interface ModelRoutingFields {
 // Copilot surfaces combine input/output metadata differently across views.
 // Reserve a modest UI output budget, while requests still use the real model max.
 const UI_OUTPUT_TOKEN_RESERVE = 8192;
+const MESSAGE_TOKEN_OVERHEAD = 4;
+const MESSAGE_NAME_TOKEN_OVERHEAD = 1;
+const TOOL_CALL_TOKEN_OVERHEAD = 10;
+const TOOL_RESULT_TOKEN_OVERHEAD = 6;
+const IMAGE_TOKEN_ESTIMATE = 1024;
 
 type CopilotCompatibleCapabilities = vscode.LanguageModelChatCapabilities & {
   supportsToolCalling: boolean;
@@ -1162,8 +1167,9 @@ class OpenCodeProvider implements vscode.LanguageModelChatProvider<OpenCodeModel
     text: string | vscode.LanguageModelChatRequestMessage,
     _token: vscode.CancellationToken
   ): Promise<number> {
-    const value = typeof text === "string" ? text : messageText(text);
-    return estimateTokenCount(value);
+    return typeof text === "string"
+      ? estimateTokenCount(text)
+      : estimateChatMessageTokenCount(text);
   }
 
   private async fetchModels(): Promise<string[]> {
@@ -1320,6 +1326,7 @@ function buildChatCompletionsRequestBody(
     temperature: settings.temperature,
     max_tokens: limits.maxOutputTokens,
     stream: true,
+    stream_options: { include_usage: true },
     ...thinkingPayload,
     ...(tools.length ? { tools, tool_choice: toolChoice(options.toolMode) } : {}),
   };
@@ -2052,6 +2059,75 @@ function reasoningForToolCalls(
 
 function messageText(message: vscode.LanguageModelChatRequestMessage): string {
   return message.content.map(partToText).filter(Boolean).join("\n");
+}
+
+function estimateChatMessageTokenCount(message: vscode.LanguageModelChatRequestMessage): number {
+  const role = typeof message.role === "string" ? message.role : String(message.role);
+  const name = typeof message.name === "string" ? message.name : "";
+  const contentTokens = message.content
+    .map(partToTokenCount)
+    .reduce((total, count) => total + count, 0);
+
+  return MESSAGE_TOKEN_OVERHEAD
+    + estimateTokenCount(role)
+    + (name ? MESSAGE_NAME_TOKEN_OVERHEAD + estimateTokenCount(name) : 0)
+    + contentTokens;
+}
+
+function partToTokenCount(part: vscode.LanguageModelInputPart | unknown): number {
+  if (part instanceof vscode.LanguageModelTextPart) {
+    return estimateTokenCount(part.value);
+  }
+
+  if (part instanceof vscode.LanguageModelToolResultPart) {
+    const contentTokens = part.content
+      .map(partToTokenCount)
+      .reduce((total, count) => total + count, 0);
+    return TOOL_RESULT_TOKEN_OVERHEAD
+      + estimateTokenCount(part.callId)
+      + contentTokens;
+  }
+
+  if (part instanceof vscode.LanguageModelToolCallPart) {
+    return TOOL_CALL_TOKEN_OVERHEAD
+      + estimateTokenCount(part.callId)
+      + estimateTokenCount(part.name)
+      + estimateStructuredTokenCount(part.input);
+  }
+
+  if (part instanceof vscode.LanguageModelDataPart) {
+    return isInternalDataPart(part) ? 0 : estimateDataPartTokenCount(part);
+  }
+
+  if (typeof part === "string") {
+    return estimateTokenCount(part);
+  }
+
+  if (isRecord(part)) {
+    return estimateStructuredTokenCount(part);
+  }
+
+  return 0;
+}
+
+function estimateStructuredTokenCount(value: unknown): number {
+  try {
+    return estimateTokenCount(JSON.stringify(value));
+  } catch {
+    return 0;
+  }
+}
+
+function estimateDataPartTokenCount(part: vscode.LanguageModelDataPart): number {
+  if (part.mimeType.startsWith("image/")) {
+    return IMAGE_TOKEN_ESTIMATE;
+  }
+
+  if (part.mimeType.startsWith("text/") || part.mimeType === "application/json") {
+    return estimateTokenCount(Buffer.from(part.data).toString("utf8"));
+  }
+
+  return Math.max(1, Math.ceil(part.data.byteLength / 4));
 }
 
 function partToText(part: vscode.LanguageModelInputPart | unknown): string {
