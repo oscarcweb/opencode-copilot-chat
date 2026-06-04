@@ -2,6 +2,13 @@
 
 All notable changes to the **OpenCode Go BYOK Provider** extension are documented here.
 
+## [0.1.9] — 2026-06-04
+
+### Fixed
+
+- Fixed Qwen models (`qwen3.5-plus`, `qwen3.6-plus`, `qwen3.6-plus-free`, `qwen3.7-max`) not being able to call VS Code tools (file reading, terminal, etc.) and responding with short answers without follow-through. The root cause was Qwen being incorrectly routed to the Anthropic Messages API (`/messages`) which uses a different tool calling format (`tool_use` content blocks) than Qwen's native OpenAI-compatible format (`choices[].delta.tool_calls`). All Qwen models now correctly route to the chat-completions endpoint (`/chat/completions`) where tool calls are properly parsed and surfaced to Copilot Chat.
+- Fixed context window indicator not updating for Qwen models by ensuring the response streaming path correctly reports usage metadata back to VS Code.
+
 ## [0.1.8] — 2026-06-04
 
 ### Added

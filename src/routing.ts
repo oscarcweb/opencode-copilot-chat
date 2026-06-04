@@ -4,10 +4,12 @@ import {
   type ProviderRoutingDefinition,
 } from "./providerTypes";
 
-function isMessagesQwenModel(modelId: string): boolean {
-  return /^qwen3\.(?:5|6)-plus(?:-free)?$/i.test(modelId)
-    || /^qwen3\.7-max$/i.test(modelId);
-}
+// NOTE: Qwen models (qwen3.*) are intentionally NOT routed to the Anthropic
+// Messages API. They use OpenAI-compatible chat-completions format natively,
+// including tool_calls in choices[].delta.tool_calls. Routing them to the
+// messages endpoint caused tool calling to break (Anthropic uses tool_use
+// content blocks with a different streaming shape) and responses to be short
+// or empty when the provider defaulted thinking on.
 
 export function resolveModelRouting(
   modelId: string,
@@ -27,8 +29,7 @@ export function resolveModelRouting(
 
   if (
     /^claude-/i.test(modelId) ||
-    (provider.vendor === GO_VENDOR && /^minimax-m2\./i.test(modelId)) ||
-    isMessagesQwenModel(modelId)
+    (provider.vendor === GO_VENDOR && /^minimax-m2\./i.test(modelId))
   ) {
     return {
       endpointKind: "messages",
