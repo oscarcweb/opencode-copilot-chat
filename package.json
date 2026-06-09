@@ -125,9 +125,9 @@
         },
         "opencodego.thinking.deepseek": {
           "type": "string",
-          "enum": ["off", "high", "max"],
+          "enum": ["off", "low", "medium", "high", "max"],
           "default": "off",
-          "markdownDescription": "Thinking mode for DeepSeek models (`deepseek-v4-flash`, `deepseek-v4-pro`). Maps to `reasoning_effort`. `off` disables reasoning, `high`/`max` enable deeper reasoning."
+          "markdownDescription": "Thinking mode for DeepSeek models (`deepseek-v4-flash`, `deepseek-v4-pro`). Maps to `reasoning_effort`. `low`/`medium`/`high` adjust reasoning depth; `max` enables maximum reasoning."
         },
         "opencodego.thinking.glm": {
           "type": "string",
@@ -143,9 +143,9 @@
         },
         "opencodego.thinking.mimo": {
           "type": "string",
-          "enum": ["on", "off"],
+          "enum": ["off", "low", "medium", "high"],
           "default": "off",
-          "markdownDescription": "Thinking mode for Mimo (Xiaomi) models. Maps to `reasoning_effort`. `on` enables reasoning via `reasoning_content`."
+          "markdownDescription": "Thinking mode for Mimo (Xiaomi) models. Maps to `reasoning_effort`. `low`/`medium`/`high` adjust reasoning depth."
         },
         "opencodego.thinking.qwen": {
           "type": "string",

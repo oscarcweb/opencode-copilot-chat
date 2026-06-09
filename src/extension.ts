@@ -244,13 +244,24 @@ interface PendingToolCall {
   arguments: string;
 }
 
+/**
+ * Reasoning effort levels per model family, sourced from the upstream
+ * OpenCode provider transform (anomalyco/opencode, packages/opencode/src/provider/transform.ts):
+ *
+ *   WIDELY_SUPPORTED_EFFORTS = ["low", "medium", "high"]
+ *   OPENAI_EFFORTS = ["none", "minimal", "low", "medium", "high", "xhigh"]
+ *
+ * For @ai-sdk/openai-compatible (Mimo, and most models routed through
+ * chat-completions): the default is WIDELY_SUPPORTED_EFFORTS = ["low", "medium", "high"].
+ * DeepSeek V4 on openai-compatible additionally adds "max" → ["low", "medium", "high", "max"].
+ */
 interface ThinkingSettings {
-  deepseek: "off" | "high" | "max";
+  deepseek: "off" | "low" | "medium" | "high" | "max";
   glm: "on" | "off";
   kimi: "on" | "off";
   qwen: "auto" | "on" | "off";
   qwenBudget: "auto" | "4096" | "16384" | "32768" | "81920";
-  mimo: "off" | "on";
+  mimo: "off" | "low" | "medium" | "high";
 }
 
 interface ApiSettings {
@@ -466,10 +477,10 @@ async function showModelPickerDiagnostics(): Promise<void> {
 
 async function showThinkingEffortPicker(): Promise<void> {
   const families: { label: string; key: keyof ThinkingSettings; options: string[] }[] = [
-    { label: "DeepSeek (deepseek-v4-*)", key: "deepseek", options: ["off", "high", "max"] },
+    { label: "DeepSeek (deepseek-v4-*)", key: "deepseek", options: ["off", "low", "medium", "high", "max"] },
     { label: "GLM (glm-5, glm-5.1)", key: "glm", options: ["on", "off"] },
     { label: "Kimi (kimi-k2.*)", key: "kimi", options: ["on", "off"] },
-    { label: "Mimo (mimo-v2.*)", key: "mimo", options: ["on", "off"] },
+    { label: "Mimo (mimo-v2.*)", key: "mimo", options: ["off", "low", "medium", "high"] },
     { label: "Qwen (qwen3.*)", key: "qwen", options: ["auto", "on", "off"] },
     { label: "Qwen Thinking Budget", key: "qwenBudget", options: ["auto", "4096", "16384", "32768", "81920"] }
   ];
@@ -2325,10 +2336,12 @@ function modelConfigurationSchema(
         reasoningEffort: {
           type: "string",
           title: "Thinking Effort",
-          enum: ["off", "high", "max"],
-          enumItemLabels: ["Off", "High", "Max"],
+          enum: ["off", "low", "medium", "high", "max"],
+          enumItemLabels: ["Off", "Low", "Medium", "High", "Max"],
           enumDescriptions: [
             "Fastest responses",
+            "Minimal reasoning",
+            "Balanced reasoning",
             "More reasoning",
             "Maximum reasoning"
           ],
@@ -2346,10 +2359,12 @@ function modelConfigurationSchema(
         reasoningEffort: {
           type: "string",
           title: "Thinking Effort",
-          enum: ["off", "on"],
-          enumItemLabels: ["Off", "On"],
+          enum: ["off", "low", "medium", "high"],
+          enumItemLabels: ["Off", "Low", "Medium", "High"],
           enumDescriptions: [
             "Fastest responses",
+            "Minimal reasoning",
+            "Balanced reasoning",
             "Enable reasoning"
           ],
           default: "off",
@@ -2457,8 +2472,8 @@ function applyRequestThinkingOverride(
   const thinkingBudget = override.thinkingBudget;
 
   if (family === "deepseek" && typeof reasoningEffort === "string") {
-    if (reasoningEffort === "off" || reasoningEffort === "high" || reasoningEffort === "max") {
-      next.deepseek = reasoningEffort;
+    if (["off", "low", "medium", "high", "max"].includes(reasoningEffort)) {
+      next.deepseek = reasoningEffort as ThinkingSettings["deepseek"];
     }
   }
   if (family === "glm" && typeof thinkingMode === "string") {
@@ -2474,8 +2489,8 @@ function applyRequestThinkingOverride(
     if (reasoningEffort === "on" || reasoningEffort === "off") next.kimi = reasoningEffort;
   }
   if (family === "mimo") {
-    if (typeof reasoningEffort === "string" && (reasoningEffort === "on" || reasoningEffort === "off")) {
-      next.mimo = reasoningEffort;
+    if (typeof reasoningEffort === "string" && ["off", "low", "medium", "high"].includes(reasoningEffort)) {
+      next.mimo = reasoningEffort as ThinkingSettings["mimo"];
     }
   }
   if (family === "qwen") {
@@ -2588,10 +2603,11 @@ function buildThinkingPayload(modelId: string, thinking: ThinkingSettings, hasIm
 
   if (/^mimo-/i.test(modelId)) {
     // Mimo models use OpenAI-compatible chat-completions with reasoning_content.
+    // Supported efforts: low, medium, high (per OpenCode upstream defaults).
     if (thinking.mimo === "off") {
       return {};
     }
-    return { reasoning_effort: "high" };
+    return { reasoning_effort: thinking.mimo };
   }
 
   return {};

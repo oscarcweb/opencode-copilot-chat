@@ -6,9 +6,9 @@ All notable changes to the **OpenCode Go BYOK Provider** extension are documente
 
 ### Added
 
-- **Mimo (Xiaomi) models** can now select thinking effort via the VS Code model picker. All `mimo-v2.*` models (`mimo-v2.5`, `mimo-v2.5-pro`, `mimo-v2-omni`, `mimo-v2-pro`) gain a native "Thinking Effort" control (`off`/`on`) sourced from live `models.dev` metadata. When enabled, the extension sends `reasoning_effort: "high"` to activate the model's `reasoning_content` streaming output.
+- **Richer thinking efforts for Mimo and DeepSeek models.** All Mimo (`mimo-v2.*`) models now support `off`/`low`/`medium`/`high` reasoning effort levels, and DeepSeek (`deepseek-v4-*`) models now support `off`/`low`/`medium`/`high`/`max` — matching the upstream OpenCode reasoning effort options sourced from the official OpenCode provider `transform.ts`. The `opencodego.thinking.mimo` and `opencodego.thinking.deepseek` settings have been updated with the expanded enum values.
 - **Dynamic configuration schema** — any model with `reasoning: true` in its resolved metadata (from `models.dev`, live API, or bundled fallback) automatically gets a generic `off`/`on` Thinking Effort control in the model picker, without requiring a hardcoded family mapping. Future reasoning-capable models will work out of the box.
-- New setting `opencodego.thinking.mimo` (`"on"` / `"off"`, default `"off"`) to control Mimo thinking mode globally.
+- New settings `opencodego.thinking.mimo` (`"off"` / `"low"` / `"medium"` / `"high"`, default `"off"`) and expanded `opencodego.thinking.deepseek` (`"off"` / `"low"` / `"medium"` / `"high"` / `"max"`, default `"off"`).
 
 ## [0.2.3] — 2026-06-09
 
